@@ -518,7 +518,6 @@ export const updateMatch = async (req, res, next) => {
     next(err);
   }
 };
-
    
   export const getSingleMatchById = async (req, res, next) => {
     try {
