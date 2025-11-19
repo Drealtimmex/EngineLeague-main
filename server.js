@@ -35,9 +35,10 @@ dotenv.config();
 // const emailRoutes = require('./emailRoutes');
 app.use(cookieParser());
 app.use(cors({
-  origin: ['http://localhost:3001','https://a3ef-102-89-33-230.ngrok-free.app','https://engine2-0frontend.onrender.com','http://172.20.10.2:3001'],
+  origin: ['http://localhost:3001','https://engine2-0frontend.vercel.app','https://engine2-0frontend.onrender.com','http://172.20.10.2:3001'],
   methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
   credentials: true
+  
 }));
 app.use(express.json());
 app.use("/api/auth", authRoutes);
