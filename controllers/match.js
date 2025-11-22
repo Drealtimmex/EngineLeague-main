@@ -97,14 +97,34 @@ export const updateMatch = async (req, res, next) => {
     const awayId = toObjectId(typeof match.awayTeam === "object" ? match.awayTeam._id : match.awayTeam);
 
     // helper to resolve incoming team values (returns ObjectId or null)
-    const resolveIncomingTeam = (val) => {
-      if (!val) return null;
-      const txt = String(val);
-      if (txt === "home") return homeId;
-      if (txt === "away") return awayId;
-      if (isValidId(txt)) return toObjectId(txt);
-      return null;
-    };
+   // helper to resolve incoming team values (returns ObjectId or null)
+const resolveIncomingTeam = (val) => {
+  if (!val) return null;
+
+  // If it's an object that looks like a Mongoose doc or has _id, use that
+  if (typeof val === "object") {
+    if (val._id) return toObjectId(val._id);
+    // sometimes client may send { side: 'home' } or { team: 'away' }
+    const maybe = String(val.side ?? val.team ?? "").trim();
+    if (maybe) {
+      const lower = maybe.toLowerCase();
+      if (lower === "home" || lower === "h") return homeId;
+      if (lower === "away" || lower === "a") return awayId;
+    }
+  }
+
+  // handle simple strings (case-insensitive)
+  const txt = String(val).trim();
+  const lower = txt.toLowerCase();
+  if (lower === "home" || lower === "h") return homeId;
+  if (lower === "away" || lower === "a") return awayId;
+
+  // if it's an objectId string
+  if (isValidId(txt)) return toObjectId(txt);
+
+  return null;
+};
+
 
     // --------------------------
     // 1) Goals (robust handling incl own goals)
