@@ -9,7 +9,7 @@ const router = express.Router();
 router.post("/", verifyToken, createTimeline);
 
 // Get all timeline entries for a match (public)
-router.get("/match/:matchId", getTimelinesByMatch);
+router.get("/:matchId", getTimelinesByMatch);
 
 // Update timeline entry (protected)
 router.put("/:id", verifyToken, updateTimeline);
