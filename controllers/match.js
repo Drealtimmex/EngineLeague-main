@@ -545,6 +545,65 @@ export const updateMatch = async (req, res, next) => {
  * - saves the Timeline doc and pushes its id to match.timeline
  */
 
+export const getMatchesByTeam = async (req, res, next) => {
+  try {
+    const { teamId } = req.params;
+    if (!teamId) return next(createError(400, "teamId required"));
+
+    // find matches where the team is home or away
+    const matches = await Match.find({
+      $or: [{ homeTeam: teamId }, { awayTeam: teamId }],
+    })
+      .populate({ path: "homeTeam", model: "Team", select: "name logo" })
+      .populate({ path: "awayTeam", model: "Team", select: "name logo" })
+      .populate({ path: "goals.scorer", model: "Player", select: "name" })
+      .populate({ path: "goals.assist", model: "Player", select: "name" })
+      .sort({ date: -1 })
+      .lean();
+
+    // normalize response for client
+    const out = matches.map((m) => {
+      const homeTeamObj = m.homeTeam || null;
+      const awayTeamObj = m.awayTeam || null;
+
+      // compute home/away goals by comparing goal.team to home/away id
+      const homeGoals = (m.goals || []).filter((g) => {
+        if (!g.team) return false;
+        const t = g.team.toString ? g.team.toString() : String(g.team);
+        return homeTeamObj && String(homeTeamObj._id) === t;
+      }).length;
+
+      const awayGoals = (m.goals || []).filter((g) => {
+        if (!g.team) return false;
+        const t = g.team.toString ? g.team.toString() : String(g.team);
+        return awayTeamObj && String(awayTeamObj._id) === t;
+      }).length;
+
+      return {
+        _id: m._id,
+        date: m.date ? new Date(m.date).toISOString() : null,
+        venue: m.venue ?? null,
+        fulltime: !!m.fulltime,
+        result: m.fulltime ? `${homeGoals} - ${awayGoals}` : null,
+        homeTeam: homeTeamObj ? { _id: homeTeamObj._id, name: homeTeamObj.name, logo: homeTeamObj.logo } : null,
+        awayTeam: awayTeamObj ? { _id: awayTeamObj._id, name: awayTeamObj.name, logo: awayTeamObj.logo } : null,
+        goals: (m.goals || []).map((g) => ({
+          minute: g.minute,
+          team: g.team,
+          scorer: g.scorer ? (g.scorer.name || String(g.scorer._id ?? g.scorer)) : null,
+          assist: g.assist ? (g.assist.name || String(g.assist._id ?? g.assist)) : null,
+          ownGoal: !!g.ownGoal,
+        })),
+      };
+    });
+
+    return res.status(200).json({ success: true, data: out });
+  } catch (err) {
+    console.error("getMatchesByTeam error:", err);
+    next(err);
+  }
+};
+
 
 
 

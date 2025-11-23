@@ -312,8 +312,8 @@ export const createFixturesManually = async (req, res, next) => {
         if (!homeTeam || !awayTeam) return next(createError(400, "homeTeam and awayTeam are required for each fixture"));
 
         const match = await Match.create({
-          homeTeam: mongoose.Types.ObjectId(homeTeam),
-          awayTeam: mongoose.Types.ObjectId(awayTeam),
+          homeTeam: new mongoose.Types.ObjectId(homeTeam),
+          awayTeam: new mongoose.Types.ObjectId(awayTeam),
           date,
           venue,
           lineups: { home: [], away: [] },
@@ -328,8 +328,8 @@ export const createFixturesManually = async (req, res, next) => {
 
         const fixture = await Fixture.create({
           gameweek: null,
-          homeTeam: mongoose.Types.ObjectId(homeTeam),
-          awayTeam: mongoose.Types.ObjectId(awayTeam),
+          homeTeam:new mongoose.Types.ObjectId(homeTeam),
+          awayTeam:new  mongoose.Types.ObjectId(awayTeam),
           bye: false,
           match: match._id,
           competitionId,

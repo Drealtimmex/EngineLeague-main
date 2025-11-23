@@ -7,7 +7,7 @@ const router = express.Router();
 // create
 router.post("/", verifyToken, createTeam);
 //get
-router.get("/:id", getTeamById);
+router.get("/:teamId", getTeamById);
 // router.get("/team/:name", getTeamByName);
 router.get("/", getAllTeams);
 router.get("/getAll/:id", getAllTeamsByCompetition);
