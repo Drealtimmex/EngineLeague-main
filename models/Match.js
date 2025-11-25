@@ -85,6 +85,14 @@ const MatchSchema = new Schema(
         rating: { type: Number },
       },
     ],
+     gameweek: { type: Number, default: null },
+
+  // NEW: mark if fantasy points for this match were computed
+  fantasyProcessed: { type: Boolean, default: false },
+
+  // NEW: store per-team points for this match (teamId -> points)
+  // Using a Map of Numbers; will be stored as an object in Mongo
+  fantasyTeamPoints: { type: Map, of: Number, default: {} },
     manOftheMatch: { type: Schema.Types.ObjectId, ref: "Player", required: false },
 
     // timeline docs are separate model; we store references
