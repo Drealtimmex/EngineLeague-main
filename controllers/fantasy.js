@@ -3,12 +3,13 @@ import mongoose from "mongoose";
 import { createError } from "../error.js";
 import User from "../models/User.js";
 import Player from "../models/Player.js";
+
 import Team from "../models/Team.js";
 import Match from "../models/Match.js";
 import Fixture from "../models/Fixtures.js";
 import Gameweek from "../models/Gameweek.js";
 import FantasyTeam from "../models/Felteam.js";
-
+const { Types } = mongoose;
 /**
  * NOTE / Model expectations:
  * - FantasyTeam.players : [{ player: ObjectId, isStarting: Boolean, playerPrice: Number, position: String, team: ObjectId }]
@@ -477,8 +478,7 @@ export const setLineup = async (req, res, next) => {
     next(err);
   }
 };
-
-
+ 
 /**
  * Get all fantasy teams (optionally filter by competition or user)
  * Query params: userId?, competitionId?
@@ -953,6 +953,196 @@ export async function computePointsForMatch(matchId) {
  *
  * I will not modify your entire updateMatch here, but add the call example in comments.
  */
+// controllers/fantasyController.js
+
+/**
+ * Helper: normalize position to GK/DEF/MID/FWD
+ */
+
+/**
+ * Count categories of a players array (expects objects of the playerEntrySchema)
+ * returns { GK, DEF, MID, FWD }
+ */
+ function normalizePosition(pos) {
+      const p = (pos || "").toUpperCase();
+      if (p === "GK") return "GK";
+      if (["CB", "LB", "RB", "LWB", "RWB"].includes(p)) return "DEF";
+      if (["CM", "DM", "AM", "LM", "RM"].includes(p)) return "MID";
+      if (["ST", "CF", "LW", "RW", "FW"].includes(p)) return "FWD";
+      return "MID";
+    }
+   
+function countByCategory(players = []) {
+  const counts = { GK: 0, DEF: 0, MID: 0, FWD: 0 };
+  for (const p of players || []) {
+    const pos = p.position || (p.player && p.player.position) || "";
+    const cat = normalizePosition(pos);
+    if (p.isStarting) counts[cat] = (counts[cat] || 0) + 1;
+  }
+  return counts;
+}
+
+/**
+ * Validate lineup counts and return error message if invalid, else null
+ */
+function validateLineupCounts(players) {
+  const starting = players.filter((p) => p.isStarting);
+  if (starting.length !== 11) return "Starting XI must have exactly 11 players.";
+  const counts = countByCategory(players);
+  if (counts.GK !== 1) return "Starting XI must have exactly 1 goalkeeper.";
+  if (counts.DEF < 3 || counts.DEF > 5) return "Defenders must be between 3 and 5.";
+  if (counts.MID < 3 || counts.MID > 5) return "Midfielders must be between 3 and 5.";
+  if (counts.FWD < 1 || counts.FWD > 3) return "Forwards must be between 1 and 3.";
+  return null;
+}
+
+/**
+ * POST /api/fantasy/substitute
+ * body: { fantasyTeamId, out: <playerIdOut>, in: <playerIdIn> }
+ * Auth: req.user.id must be owner of the team
+ */
+export const substitutePlayers = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    const { fantasyTeamId, out: outId, in: inId } = req.body;
+    if (!fantasyTeamId || !outId || !inId) return res.status(400).json({ message: "fantasyTeamId, out and in are required" });
+
+    // Basic ObjectId validation
+    if (!Types.ObjectId.isValid(fantasyTeamId) || !Types.ObjectId.isValid(outId) || !Types.ObjectId.isValid(inId)) {
+      return res.status(400).json({ message: "Invalid id(s) provided" });
+    }
+
+    const team = await FantasyTeam.findById(fantasyTeamId).exec();
+    if (!team) return res.status(404).json({ message: "Fantasy team not found" });
+
+    // Auth: only owner can substitute
+    if (!userId || String(team.user) !== String(userId)) {
+      return res.status(403).json({ message: "Forbidden: not team owner" });
+    }
+
+    // Ensure both players exist in roster
+    const outEntry = team.players.find((p) => String(p.player) === String(outId));
+    const inEntry = team.players.find((p) => String(p.player) === String(inId));
+    if (!outEntry) return res.status(400).json({ message: "Player to remove (out) not found in this team's roster" });
+    if (!inEntry) return res.status(400).json({ message: "Player to add (in) not found in this team's roster" });
+
+    // If swapping between an external player (not on roster) you'd handle differently,
+    // but per your schema substitution is between roster entries (starter vs bench).
+
+    // Position categories
+    const outPos = normalizePosition(outEntry.position || (outEntry.player && outEntry.player.position));
+    const inPos = normalizePosition(inEntry.position || (inEntry.player && inEntry.player.position));
+
+    // GK rule: GK can only be swapped with GK
+    if (outPos === "GK" || inPos === "GK") {
+      if (!(outPos === "GK" && inPos === "GK")) {
+        return res.status(400).json({ message: "Goalkeeper may only be substituted with another goalkeeper." });
+      }
+    }
+
+    // Perform the swap: swap isStarting flags (so we keep roster order/ids intact)
+    // If you want to truly swap player docs (IDs) in roster slots instead, change accordingly.
+    const newPlayers = team.players.map((p) => {
+      const pid = String(p.player);
+      if (pid === String(outId)) return { ...p.toObject(), isStarting: false };
+      if (pid === String(inId)) return { ...p.toObject(), isStarting: true };
+      return p.toObject ? p.toObject() : p;
+    });
+
+    // Validate counts after swap
+    const vErr = validateLineupCounts(newPlayers);
+    if (vErr) return res.status(400).json({ message: vErr });
+
+    // Save results to DB: update players array and lineup snapshot + lastLineupSetAt
+    team.players = newPlayers;
+    team.lastLineupSetAt = new Date();
+
+    // create a lineup snapshot under "default" — you can change key to a GW number if desired
+    const startingIds = newPlayers.filter((p) => p.isStarting).map((p) => String(p.player));
+    const snapshot = {
+      starting: startingIds,
+      captain: team.captain ? String(team.captain) : null,
+      viceCaptain: team.viceCaptain ? String(team.viceCaptain) : null,
+      setAt: new Date(),
+      isDefault: true,
+    };
+
+    // ensure lineupSnapshots is a Map compatible object
+    if (!team.lineupSnapshots) team.lineupSnapshots = new Map();
+    team.lineupSnapshots.set("default", snapshot);
+
+    await team.save();
+
+    // return updated team (lean on client to re-populate player docs if needed)
+    return res.json({ message: "Substitution applied", data: team });
+  } catch (err) {
+    console.error("substitutePlayers error", err);
+    return res.status(500).json({ message: "Internal server error" });
+  }
+};
+
+
+/**
+ * POST /api/fantasy/set-captain
+ * body: { fantasyTeamId, captain?: playerId, viceCaptain?: playerId }
+ * Auth: req.user.id must be owner
+ */
+export const setCaptainVice = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    const { fantasyTeamId, captain, viceCaptain } = req.body;
+    if (!fantasyTeamId) return res.status(400).json({ message: "fantasyTeamId is required" });
+    if (!Types.ObjectId.isValid(fantasyTeamId)) return res.status(400).json({ message: "Invalid team id" });
+
+    const team = await FantasyTeam.findById(fantasyTeamId).exec();
+    if (!team) return res.status(404).json({ message: "Fantasy team not found" });
+
+    // Auth
+    if (!userId || String(team.user) !== String(userId)) {
+      return res.status(403).json({ message: "Forbidden: not team owner" });
+    }
+
+    // Collect starting players ids
+    const startingIds = team.players.filter((p) => p.isStarting).map((p) => String(p.player));
+
+    // If captain provided -> validate is in starting XI
+    if (captain) {
+      if (!Types.ObjectId.isValid(captain)) return res.status(400).json({ message: "Invalid captain id" });
+      if (!startingIds.includes(String(captain))) {
+        return res.status(400).json({ message: "Captain must be one of the starting XI." });
+      }
+      team.captain = captain;
+    }
+
+    if (viceCaptain) {
+      if (!Types.ObjectId.isValid(viceCaptain)) return res.status(400).json({ message: "Invalid viceCaptain id" });
+      if (!startingIds.includes(String(viceCaptain))) {
+        return res.status(400).json({ message: "Vice-captain must be one of the starting XI." });
+      }
+      team.viceCaptain = viceCaptain;
+    }
+
+    team.lastLineupSetAt = new Date();
+
+    // also write snapshot
+    const snapshot = {
+      starting: startingIds,
+      captain: team.captain ? String(team.captain) : null,
+      viceCaptain: team.viceCaptain ? String(team.viceCaptain) : null,
+      setAt: new Date(),
+      isDefault: true,
+    };
+    if (!team.lineupSnapshots) team.lineupSnapshots = new Map();
+    team.lineupSnapshots.set("default", snapshot);
+
+    await team.save();
+
+    return res.json({ message: "Captain/vice updated", data: team });
+  } catch (err) {
+    console.error("setCaptainVice error", err);
+    return res.status(500).json({ message: "Internal server error" });
+  }
+};
 
 export default {
   createFantasyTeam,
