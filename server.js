@@ -35,7 +35,7 @@ dotenv.config();
 // const emailRoutes = require('./emailRoutes');
 app.use(cookieParser());
 app.use(cors({
-  origin: ['http://localhost:3001','http://localhost:3000','https://engine2-0frontend.vercel.app','https://engine2-0frontend.onrender.com','http://172.20.10.2:3001'],
+  origin: ['http://localhost:3001','http://localhost:3000','https://engine3-0frontend.vercel.app','https://engine3-0.vercel.app','http://172.20.10.2:3001'],
   methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
   credentials: true
   

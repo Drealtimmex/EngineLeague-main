@@ -365,13 +365,12 @@ export const makeTransfers = async (req, res, next) => {
  * - Exactly 11 starting players (we don't strictly validate formation here beyond counts)
  * - Captain must be among starting players
  */
+// controllers/fantasyController.js (Node/Express style)
+
 export const setLineup = async (req, res, next) => {
   try {
     const userId = req.user.id;
     const { fantasyTeamId, startingPlayerIds, captain, viceCaptain, target } = req.body;
-    // target: optional. if "default" -> default lineup snapshot.
-    // if numeric -> specific gameweek number to snapshot (e.g. 3).
-    // if omitted -> use upcoming GW (same as previous behavior).
 
     if (!fantasyTeamId) return next(createError(400, "fantasyTeamId required"));
     if (!Array.isArray(startingPlayerIds) || startingPlayerIds.length !== 11)
@@ -388,6 +387,7 @@ export const setLineup = async (req, res, next) => {
       if (!rosterIds.includes(String(sid))) return next(createError(400, "Starting players must be from your roster"));
     }
     if (!startingPlayerIds.map(String).includes(String(captain))) return next(createError(400, "Captain must be among starting players"));
+    if (viceCaptain && !startingPlayerIds.map(String).includes(String(viceCaptain))) return next(createError(400, "Vice-captain must be among starting players"));
 
     // identify target gameweek
     let targetGw = null;
@@ -415,9 +415,63 @@ export const setLineup = async (req, res, next) => {
       if (now >= upcomingGW.deadline) return next(createError(403, "Cannot set lineup after deadline for upcoming gameweek"));
     }
 
-    // Compose snapshot 
+    // Validate formation counts using player positions from roster
+    // Build a map of playerId -> position
+    const posMap = {};
+    for (const p of team.players) {
+      posMap[String(p.player)] = p.position || null;
+    }
+    const counts = { GK: 0, DEF: 0, MID: 0, FWD: 0 };
+    function normalizePositionShort(pos) {
+      const p = (pos || "").toUpperCase();
+      if (p === "GK") return "GK";
+      if (["CB", "LB", "RB", "LWB", "RWB"].includes(p)) return "DEF";
+      if (["CM", "DM", "AM", "LM", "RM"].includes(p)) return "MID";
+      if (["ST", "CF", "LW", "RW", "FW"].includes(p)) return "FWD";
+      return "MID";
+    }
+    for (const sid of startingPlayerIds) {
+      const pos = posMap[String(sid)];
+      const cat = normalizePositionShort(pos);
+      counts[cat] = (counts[cat] || 0) + 1;
+    }
+    if (counts.GK !== 1) return next(createError(400, "Starting XI must include exactly 1 GK"));
+    if (counts.DEF < 3 || counts.DEF > 5) return next(createError(400, "DEF must be between 3 and 5"));
+    if (counts.MID < 3 || counts.MID > 5) return next(createError(400, "MID must be between 3 and 5"));
+    if (counts.FWD < 1 || counts.FWD > 3) return next(createError(400, "FWD must be between 1 and 3"));
+
+    // compose snapshot object
+    const snapshot = {
+      starting: startingPlayerIds.map((id) => String(id)),
+      captain: String(captain),
+      viceCaptain: viceCaptain ? String(viceCaptain) : null,
+      setAt: new Date(),
+      isDefault: !!isDefault,
+    };
+
+    // store snapshot under lineupSnapshots
+    if (!team.lineupSnapshots || typeof team.lineupSnapshots !== "object") team.lineupSnapshots = {};
+    if (isDefault) {
+      team.lineupSnapshots["default"] = snapshot;
+    } else {
+      team.lineupSnapshots[String(targetGw)] = snapshot;
+    }
+
+    // update captain/vice at team root for convenience
+    team.captain = String(captain);
+    team.viceCaptain = viceCaptain ? String(viceCaptain) : null;
+
+    // Optionally set effectiveGameweek if this is upcoming gw and we want it
+    if (targetGw && (!team.effectiveGameweek || Number(team.effectiveGameweek) !== Number(targetGw))) {
+      team.effectiveGameweek = Number(targetGw);
+    }
+
+    // persist and return updated doc
     await team.save();
-    return res.status(200).json({ success: true, data: team });
+
+    // If you prefer to return populated players here, you can populate before returning:
+    const populated = await FantasyTeam.findById(team._id).lean();
+    return res.status(200).json({ success: true, data: populated });
   } catch (err) {
     console.error("[setLineup] error:", err);
     next(err);
