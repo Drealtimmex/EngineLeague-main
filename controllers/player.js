@@ -47,7 +47,7 @@ export const createPlayer = async (req, res, next) => {
   
       const { name, teamId, position, playerPic } = req.body;
   
-      if (!name || !teamId || !position || !playerPic) {
+      if (!name || !teamId || !position ) {
         return next(createError(400, "All fields (name, teamId, position, playerPic) are required"));
       }
   
