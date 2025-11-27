@@ -368,29 +368,52 @@ export const makeTransfers = async (req, res, next) => {
  */
 // controllers/fantasyController.js (Node/Express style)
 
+// controllers/fantasyController.js
+
+/**
+ * POST /api/fantasy/lineup  (or whatever route you use)
+ * Body: { fantasyTeamId, startingPlayerIds: string[11], captain, viceCaptain?, target? }
+ */
 export const setLineup = async (req, res, next) => {
   try {
-    const userId = req.user.id;
+    const userId = req.user && (req.user.id || req.user._id);
     const { fantasyTeamId, startingPlayerIds, captain, viceCaptain, target } = req.body;
 
+    // basic validation
     if (!fantasyTeamId) return next(createError(400, "fantasyTeamId required"));
     if (!Array.isArray(startingPlayerIds) || startingPlayerIds.length !== 11)
       return next(createError(400, "startingPlayerIds must be an array of 11 player ids"));
     if (!captain) return next(createError(400, "captain required"));
 
+    // load team
     const team = await FantasyTeam.findById(fantasyTeamId);
     if (!team) return next(createError(404, "Fantasy team not found"));
-    if (String(team.user) !== String(userId)) return next(createError(403, "Not authorized"));
 
-    // verify roster contains players
-    const rosterIds = team.players.map((p) => String(p.player));
+    // owner check
+    if (!userId || String(team.user) !== String(userId)) return next(createError(403, "Not authorized"));
+
+    // roster ids (stringified)
+    const rosterIds = (team.players || []).map((p) => {
+      // p.player might be an ObjectId or populated object; handle both
+      if (!p || typeof p !== "object") return String(p);
+      const raw = p.player;
+      if (!raw) return "";
+      if (typeof raw === "string") return String(raw);
+      if (raw._id) return String(raw._id);
+      return String(raw);
+    }).filter(Boolean);
+
+    // ensure every starting id is in roster
     for (const sid of startingPlayerIds) {
       if (!rosterIds.includes(String(sid))) return next(createError(400, "Starting players must be from your roster"));
     }
-    if (!startingPlayerIds.map(String).includes(String(captain))) return next(createError(400, "Captain must be among starting players"));
-    if (viceCaptain && !startingPlayerIds.map(String).includes(String(viceCaptain))) return next(createError(400, "Vice-captain must be among starting players"));
 
-    // identify target gameweek
+    // ensure captain/vice are among starting
+    const startingSet = new Set(startingPlayerIds.map(String));
+    if (!startingSet.has(String(captain))) return next(createError(400, "Captain must be among starting players"));
+    if (viceCaptain && !startingSet.has(String(viceCaptain))) return next(createError(400, "Vice-captain must be among starting players"));
+
+    // determine target GW / default
     let targetGw = null;
     let isDefault = false;
     if (typeof target !== "undefined" && target !== null) {
@@ -402,38 +425,40 @@ export const setLineup = async (req, res, next) => {
         else return next(createError(400, "target must be 'default' or a valid gameweek number"));
       }
     } else {
-      // no explicit target => upcoming GW
+      // pick upcoming gameweek by default
       const upcoming = await getUpcomingGameweek();
       if (!upcoming || !upcoming.number) return next(createError(400, "No active gameweek"));
       targetGw = upcoming.number;
     }
 
-    // If setting for the upcoming GW, enforce deadline guard
+    // if target is upcoming GW, check deadline guard
     const upcomingGW = await getUpcomingGameweek();
-    const now = new Date();
     if (targetGw && upcomingGW && targetGw === upcomingGW.number) {
       if (!upcomingGW.deadline) return next(createError(400, "No active gameweek deadline"));
-      if (now >= upcomingGW.deadline) return next(createError(403, "Cannot set lineup after deadline for upcoming gameweek"));
+      const now = new Date();
+      if (now >= new Date(upcomingGW.deadline)) return next(createError(403, "Cannot set lineup after deadline for upcoming gameweek"));
     }
 
-    // Validate formation counts using player positions from roster
-    // Build a map of playerId -> position
+    // Build map playerId -> position (use position saved on team.players)
     const posMap = {};
-    for (const p of team.players) {
-      posMap[String(p.player)] = p.position || null;
-    }
+    (team.players || []).forEach((p) => {
+      const pid = p && p.player && (typeof p.player === "object" ? String(p.player._id ?? p.player) : String(p.player));
+      if (pid) posMap[String(pid)] = (p.position || (p.player && p.player.position) || null);
+    });
+
+    // formation validation
     const counts = { GK: 0, DEF: 0, MID: 0, FWD: 0 };
-    function normalizePositionShort(pos) {
-      const p = (pos || "").toUpperCase();
-      if (p === "GK") return "GK";
-      if (["CB", "LB", "RB", "LWB", "RWB"].includes(p)) return "DEF";
-      if (["CM", "DM", "AM", "LM", "RM"].includes(p)) return "MID";
-      if (["ST", "CF", "LW", "RW", "FW"].includes(p)) return "FWD";
+    function normalizePosShort(pos) {
+      const q = (pos || "").toUpperCase();
+      if (q === "GK") return "GK";
+      if (["CB", "LB", "RB", "LWB", "RWB"].includes(q)) return "DEF";
+      if (["CM", "DM", "AM", "LM", "RM"].includes(q)) return "MID";
+      if (["ST", "CF", "LW", "RW", "FW"].includes(q)) return "FWD";
       return "MID";
     }
     for (const sid of startingPlayerIds) {
       const pos = posMap[String(sid)];
-      const cat = normalizePositionShort(pos);
+      const cat = normalizePosShort(pos);
       counts[cat] = (counts[cat] || 0) + 1;
     }
     if (counts.GK !== 1) return next(createError(400, "Starting XI must include exactly 1 GK"));
@@ -441,7 +466,7 @@ export const setLineup = async (req, res, next) => {
     if (counts.MID < 3 || counts.MID > 5) return next(createError(400, "MID must be between 3 and 5"));
     if (counts.FWD < 1 || counts.FWD > 3) return next(createError(400, "FWD must be between 1 and 3"));
 
-    // compose snapshot object
+    // create snapshot
     const snapshot = {
       starting: startingPlayerIds.map((id) => String(id)),
       captain: String(captain),
@@ -450,34 +475,55 @@ export const setLineup = async (req, res, next) => {
       isDefault: !!isDefault,
     };
 
-    // store snapshot under lineupSnapshots
+    // ensure lineupSnapshots exists
     if (!team.lineupSnapshots || typeof team.lineupSnapshots !== "object") team.lineupSnapshots = {};
+
     if (isDefault) {
       team.lineupSnapshots["default"] = snapshot;
     } else {
       team.lineupSnapshots[String(targetGw)] = snapshot;
     }
 
-    // update captain/vice at team root for convenience
+    // update root-level captain/vice for convenience
     team.captain = String(captain);
     team.viceCaptain = viceCaptain ? String(viceCaptain) : null;
 
-    // Optionally set effectiveGameweek if this is upcoming gw and we want it
+    // update players[].isStarting according to snapshot (bench = not in starting)
+    const startingIdsSet = new Set(snapshot.starting.map(String));
+    if (Array.isArray(team.players)) {
+      team.players.forEach((entry) => {
+        const pid = entry && entry.player && (typeof entry.player === "object" ? String(entry.player._id ?? entry.player) : String(entry.player));
+        entry.isStarting = pid ? startingIdsSet.has(String(pid)) : false;
+      });
+    }
+
+    // optionally set effectiveGameweek if it's the upcoming gw
     if (targetGw && (!team.effectiveGameweek || Number(team.effectiveGameweek) !== Number(targetGw))) {
       team.effectiveGameweek = Number(targetGw);
     }
 
-    // persist and return updated doc
+    // persist
     await team.save();
 
-    // If you prefer to return populated players here, you can populate before returning:
-    const populated = await FantasyTeam.findById(team._id).lean();
+    // return populated team (players.player and nested team populated)
+    // adjust fields selected as you wish
+    const populated = await FantasyTeam.findById(team._id)
+      .populate({
+        path: "players.player",
+        select: "name position price fantasyStats team teamLogo",
+        populate: { path: "team", select: "name _id" },
+      })
+      .populate({ path: "user", select: "username email _id" })
+      .lean();
+
     return res.status(200).json({ success: true, data: populated });
   } catch (err) {
     console.error("[setLineup] error:", err);
-    next(err);
+    return next(err);
   }
-};
+}
+
+
  
 /**
  * Get all fantasy teams (optionally filter by competition or user)
