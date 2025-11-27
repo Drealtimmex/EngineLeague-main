@@ -240,28 +240,34 @@ export const editFantasyTeam = async (req, res, next) => {
  * - Replacing player retains original playerPrice for bookkeeping (we store playerPrice for new incoming player)
  * - Validate budget and squad rules after transfers.
  */
+// controllers/fantasyController.js (or wherever you keep it)
+// NOTE: adjust import paths/names to match your project structure
+
+
+// Example export style matches your earlier code
 export const makeTransfers = async (req, res, next) => {
   try {
     const userId = req.user.id;
     const { fantasyTeamId, transfers } = req.body;
-    if (!fantasyTeamId || !Array.isArray(transfers)) return next(createError(400, "fantasyTeamId and transfers required"));
+    if (!fantasyTeamId || !Array.isArray(transfers)) {
+      return next(createError(400, "fantasyTeamId and transfers required"));
+    }
 
     const team = await FantasyTeam.findById(fantasyTeamId);
     if (!team) return next(createError(404, "Fantasy team not found"));
-    if (team.user.toString() !== userId) return next(createError(403, "Not authorized"));
+    if (String(team.user) !== String(userId)) return next(createError(403, "Not authorized"));
 
-    // Determine current upcoming GW and its deadline; transfers locked after deadline
+    // upcoming GW & deadline guard
     const upcomingGW = await getUpcomingGameweek();
     const now = new Date();
     if (!upcomingGW || !upcomingGW.deadline) {
-      // If no GW found (edge case), prevent transfers
       return next(createError(400, "No active gameweek found for transfers"));
     }
-    if (now >= upcomingGW.deadline) {
+    if (now >= new Date(upcomingGW.deadline)) {
       return next(createError(403, "Transfers are closed for the current gameweek"));
     }
 
-    // Reset freeTransfersUsedInGw if the team.lastResetGw < upcomingGW.number
+    // initialize/reset transfer counters for new gameweek
     if (!team.transfers) team.transfers = { lastResetGw: upcomingGW.number, freeTransfersUsedInGw: 0 };
     if (team.transfers.lastResetGw !== upcomingGW.number) {
       team.transfers.lastResetGw = upcomingGW.number;
@@ -274,87 +280,174 @@ export const makeTransfers = async (req, res, next) => {
       return next(createError(400, `You have ${freeLeft} free transfers left for this gameweek`));
     }
 
-    // Build current roster map (keep playerPrice and team info if present)
-    const roster = team.players.map((p) => {
-      const obj = p.toObject ? p.toObject() : p;
-      // ensure player and team are strings where appropriate
+    // Build current roster map (normalize to simple objects)
+    const roster = (team.players || []).map((p) => {
+      const obj = p && p.toObject ? p.toObject() : { ...(p || {}) };
+      const playerId = obj.player ? (typeof obj.player === "object" ? String(obj.player._id ?? obj.player) : String(obj.player)) : null;
       return {
-        ...obj,
-        player: obj.player ? obj.player.toString() : obj.player,
-        team: obj.team ? (obj.team._id ? obj.team._id.toString() : obj.team.toString()) : null,
+        // keep existing fields present on team.players
+        _raw: obj,
+        player: playerId,
+        isStarting: !!obj.isStarting,
+        playerPrice: obj.playerPrice ?? obj.price ?? null,
+        position: obj.position ?? (obj.player && obj.player.position) ?? null,
+        team: obj.team ? (obj.team._id ? String(obj.team._id) : String(obj.team)) : null,
       };
     });
-    const rosterMap = new Map(roster.map((r) => [r.player.toString(), r]));
 
-    // For each transfer, validate out exists and in not already in roster
-    const outIds = transfers.map((t) => t.out.toString());
-    const inIds = transfers.map((t) => t.in.toString());
+    const rosterMap = new Map(roster.map((r) => [String(r.player), r]));
 
+    // Validate out/in ids presence and uniqueness
+    const outIds = transfers.map((t) => String(t.out));
+    const inIds = transfers.map((t) => String(t.in));
+
+    // ensure outs exist in roster
     for (const outId of outIds) {
-      if (!rosterMap.has(outId)) return next(createError(400, "Attempting to remove player not in squad"));
+      if (!rosterMap.has(outId)) return next(createError(400, `Attempting to remove player not in squad: ${outId}`));
     }
+    // ensure ins are not already in roster (can't add existing player)
     for (const inId of inIds) {
-      if (rosterMap.has(inId)) return next(createError(400, "Incoming player already in squad"));
+      if (rosterMap.has(inId)) return next(createError(400, `Incoming player already in squad: ${inId}`));
     }
 
-    // Load incoming players to get price/team/position
+    // load incoming players to get team/price/position metadata
     const incomingPlayers = await Player.find({ _id: { $in: inIds } }).populate("team").lean().exec();
     if (incomingPlayers.length !== inIds.length) return next(createError(404, "Some incoming players not found"));
 
-    // Prepare new roster array by removing outs and adding ins
-    let newRoster = roster.filter((r) => !outIds.includes(r.player.toString()));
+    // Map incoming player id => player doc
+    const incomingById = {};
+    for (const p of incomingPlayers) incomingById[String(p._id)] = p;
 
-    // Add incoming enriched items (use incoming player's current team & price)
-    for (const p of incomingPlayers) {
-      newRoster.push({
-        player: p._id.toString(),
-        isStarting: false,
-        playerPrice: p.price || 10, // price locked at signing time
-        position: p.position,
-        team: p.team ? (p.team._id ? p.team._id.toString() : p.team.toString()) : null,
-      });
+    // Build newRoster: remove outs and add ins. Preserve isStarting mapping:
+    // Map each transfer pair by order: transfers[i] => outIds[i] replaced by inIds[i].
+    // If out was starting -> incoming will be starting.
+    let newRoster = roster.filter((r) => !outIds.includes(String(r.player)));
+
+    // Keep track of which outgoing players were captain/vice to clear if needed
+    const captainStr = team.captain ? String(team.captain) : null;
+    const viceStr = team.viceCaptain ? String(team.viceCaptain) : null;
+    const outsSet = new Set(outIds.map(String));
+
+    // If captain or vice are being removed, clear them
+    if (captainStr && outsSet.has(captainStr)) team.captain = null;
+    if (viceStr && outsSet.has(viceStr)) team.viceCaptain = null;
+
+    // For each transfer mapping, add incoming with isStarting set to out.isStarting
+    for (const tr of transfers) {
+      const outId = String(tr.out);
+      const inId = String(tr.in);
+
+      const outEntry = rosterMap.get(outId);
+      if (!outEntry) return next(createError(400, `Out player not found in roster: ${outId}`));
+
+      const incomingDoc = incomingById[inId];
+      if (!incomingDoc) return next(createError(404, `Incoming player not found: ${inId}`));
+
+      // create new roster entry: set isStarting to outEntry.isStarting so incoming replaces the starter if needed
+      const newEntry = {
+        player: String(incomingDoc._id),
+        isStarting: !!outEntry.isStarting,
+        playerPrice: incomingDoc.price ?? outEntry.playerPrice ?? 0,
+        position: incomingDoc.position ?? outEntry.position ?? null,
+        team: incomingDoc.team ? (incomingDoc.team._id ? String(incomingDoc.team._id) : String(incomingDoc.team)) : null,
+      };
+
+      newRoster.push(newEntry);
     }
 
-    // Defensive: roster length should remain same as before
+    // Defensive: roster length should remain same
     if (newRoster.length !== roster.length) {
       return next(createError(400, "Roster size mismatch after applying transfers"));
     }
 
-    // NEW: validate "max 3 players from same real-world team" rule
-    // Build counts keyed by team id (string)
+    // Validate "max 3 from same real-world team"
     const teamCounts = new Map();
     for (const r of newRoster) {
-      const teamIdStr = r.team ? r.team.toString() : null;
-      if (!teamIdStr) continue; // ignore players without team assigned (shouldn't usually happen)
+      const teamIdStr = r.team ? String(r.team) : null;
+      if (!teamIdStr) continue;
       const cur = teamCounts.get(teamIdStr) || 0;
       const nextCount = cur + 1;
       if (nextCount > 3) {
-        // Optionally you can include the offending team name if you have a mapping, but we only have id here
         return next(createError(400, "A fantasy team cannot have more than 3 players from the same real-world team"));
       }
       teamCounts.set(teamIdStr, nextCount);
     }
 
-    // Validate new roster constraints & budget (your existing validator)
-    // Your validateAndEnrichSquad expects simplified players array, so map accordingly
-    const simplifiedPlayers = newRoster.map((r) => ({ player: r.player }));
-    const validation = await validateAndEnrichSquad(simplifiedPlayers, team.budget);
-    if (!validation.valid) return next(createError(400, validation.message));
+    // At this point, prepare simplified players array for your validator
+    const simplifiedPlayers = newRoster.map((r) => ({ player: String(r.player) }));
 
-    // Replace team.players with validated/enriched roster
-    // Note: validation.enriched should be in the shape expected by team.players (enriched entries)
-    team.players = validation.enriched;
+    // Run validation/enrichment (this should return { valid: true, enriched: [...] } or { valid:false, message })
+    const validation = await validateAndEnrichSquad(simplifiedPlayers, team.budget);
+    if (!validation || !validation.valid) {
+      const msg = validation && validation.message ? validation.message : "Squad validation failed";
+      return next(createError(400, msg));
+    }
+
+    // Apply isStarting mapping to enriched entries
+    // Build map of playerId -> isStarting from newRoster
+    const startingMap = new Map();
+    for (const r of newRoster) {
+      startingMap.set(String(r.player), !!r.isStarting);
+    }
+
+    const enriched = (validation.enriched || []).map((entry) => {
+      const pid = String(entry.player);
+      const shouldStart = !!startingMap.get(pid);
+      // ensure the enriched entry shape accepts isStarting
+      return { ...entry, isStarting: shouldStart };
+    });
+
+    // Final defensive formation check: ensure starting count is 11 and formation rules satisfied
+    const startingCount = enriched.filter((e) => e.isStarting).length;
+    if (startingCount !== 11) {
+      return next(createError(400, `After transfers, starting XI must have 11 players (found ${startingCount}).`));
+    }
+    // Optionally re-check positional composition using enriched entries
+    const posCounts = { GK: 0, DEF: 0, MID: 0, FWD: 0 };
+    function normalizeShort(pos) {
+      const q = (pos || "").toUpperCase();
+      if (q === "GK") return "GK";
+      if (["CB", "LB", "RB", "LWB", "RWB"].includes(q)) return "DEF";
+      if (["CM", "DM", "AM", "LM", "RM"].includes(q)) return "MID";
+      if (["ST", "CF", "LW", "RW", "FW"].includes(q)) return "FWD";
+      return "MID";
+    }
+    for (const e of enriched) {
+      if (!e.isStarting) continue;
+      const cat = normalizeShort(e.position || e.playerPosition || e.pos || e.position);
+      posCounts[cat] = (posCounts[cat] || 0) + 1;
+    }
+    if (posCounts.GK !== 1) return next(createError(400, "Starting XI must include exactly 1 GK after transfers"));
+    if (posCounts.DEF < 3 || posCounts.DEF > 5) return next(createError(400, "DEF must be between 3 and 5 after transfers"));
+    if (posCounts.MID < 3 || posCounts.MID > 5) return next(createError(400, "MID must be between 3 and 5 after transfers"));
+    if (posCounts.FWD < 1 || posCounts.FWD > 3) return next(createError(400, "FWD must be between 1 and 3 after transfers"));
+
+    // Replace team.players with enriched roster
+    team.players = enriched;
 
     // Update free transfers used
     team.transfers.freeTransfersUsedInGw = (team.transfers.freeTransfersUsedInGw || 0) + numRequested;
+    team.transfers.lastResetGw = upcomingGW.number;
 
     await team.save();
-    return res.status(200).json({ success: true, data: team });
+
+    // Return populated team so frontend receives populated player objects (and player.team)
+    const populated = await FantasyTeam.findById(team._id)
+      .populate({
+        path: "players.player",
+        select: "name position price fantasyStats team teamLogo totalFantasyPoints",
+        populate: { path: "team", select: "name _id" },
+      })
+      .populate({ path: "user", select: "username email _id" })
+      .lean();
+
+    return res.status(200).json({ success: true, data: populated });
   } catch (err) {
     console.error("[makeTransfers] error:", err);
-    next(err);
+    return next(err);
   }
 };
+
 
 
 /**
