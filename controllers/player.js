@@ -178,42 +178,44 @@ export const getPlayersByTeam = async (req, res, next) => {
   }
 };
 
-  // Get all Players across all Teams with filters
-  export const getAllPlayers = async (req, res, next) => {
-    try {
-      const { position, goals, assists, price, yellowCards, redCards } = req.query;
-  
-      // Initialize filters
-      const filters = {};
-      if (position) filters.position = position;
-      if (goals) filters.goals = { $gte: goals };
-      if (assists) filters.assists = { $gte: assists };
-      if (price) filters.price = { $lte: price };
-      if (yellowCards) filters.totalyellowCards = { $gte: yellowCards };
-      if (redCards) filters.totalredCards = { $gte: redCards };
-  
-      // Determine the sorting criteria
-      const sortField = goals
-        ? "goals"
-        : assists
-        ? "assists"
-        : price
-        ? "price"
-        : yellowCards
-        ? "totalyellowCards"
-        : redCards
-        ? "totalredCards"
-        : null;
-  
-      const sortCriteria = sortField ? { [sortField]: -1 } : {};
-  
-      // Fetch and sort players
-      const players = await Player.find(filters).sort(sortCriteria);
-  
-      res.status(200).json({ success: true, data: players });
-    } catch (err) {
-      next(err);
-    }
-  };
+// Get all Players across all Teams with filters (populate team.name)
+export const getAllPlayers = async (req, res, next) => {
+  try {
+    const { position, goals, assists, price, yellowCards, redCards } = req.query;
+
+    // build filters safely (convert numeric strings to numbers)
+    const filters = {};
+    if (position) filters.position = position;
+    if (goals) filters.goals = { $gte: Number(goals) };
+    if (assists) filters.assists = { $gte: Number(assists) };
+    if (price) filters.price = { $lte: Number(price) };
+    if (yellowCards) filters.totalyellowCards = { $gte: Number(yellowCards) };
+    if (redCards) filters.totalredCards = { $gte: Number(redCards) };
+
+    // sort field
+    const sortField = goals
+      ? "goals"
+      : assists
+      ? "assists"
+      : price
+      ? "price"
+      : yellowCards
+      ? "totalyellowCards"
+      : redCards
+      ? "totalredCards"
+      : null;
+    const sortCriteria = sortField ? { [sortField]: -1 } : {};
+
+    // fetch players and populate the team name only
+    const players = await Player.find(filters)
+      .sort(sortCriteria)
+      .populate("team", "name") // <- this populates team with only `name`
+      .lean(); // returns plain JS objects and is faster for read-only
+
+    res.status(200).json({ success: true, data: players });
+  } catch (err) {
+    next(err);
+  }
+};
   
   
