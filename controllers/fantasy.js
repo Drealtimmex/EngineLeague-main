@@ -696,16 +696,28 @@ export const getFantasyTeamByLoggedId = async (req, res, next) => {
  * Scoring rules.
  * Tweak this function to match your exact fantasy rules.
  * Returns integer points for a single player for the match.
+// services/computeFantasyPoints.js
+
+/**
+ * calculatePlayerMatchPoints
+ *
+ * - perf: object containing goals, assists, cards, manOfTheMatch, started, subOn
+ * - posCategory: "GK"|"DEF"|"MID"|"FWD"
+ * - concededGoals: number (goals conceded by player's team)
+ * - started: boolean
+ * - subOn: boolean
+ * - teamOutcome: "win" | "draw" | "loss" | null  (applies only if player played)
+ *
+ * Returns integer points (rounded)
  */
-function calculatePlayerMatchPoints(perf = {}, posCategory = "MID", concededGoals = 0, started = false, subOn = false) {
+export function calculatePlayerMatchPoints(perf = {}, posCategory = "MID", concededGoals = 0, started = false, subOn = false, teamOutcome = null) {
   let pts = 0;
 
-  // Example rules — tune as you like:
-  // appearance bonus
-  if (started) pts += 1;
-  else if (subOn) pts += 0; // keep 0 or small fraction (we'll round later)
+  // Appearance bonus: starter 2, sub-on 1
+  if (started) pts += 2;
+  else if (subOn) pts += 1;
 
-  // goals
+  // Goals
   const goals = Number(perf.goals || 0);
   if (goals > 0) {
     if (posCategory === "GK" || posCategory === "DEF") pts += 6 * goals;
@@ -713,38 +725,41 @@ function calculatePlayerMatchPoints(perf = {}, posCategory = "MID", concededGoal
     else pts += 4 * goals; // FWD
   }
 
-  // assists
+  // Assists
   pts += 3 * (Number(perf.assists || 0));
 
-  // man of the match
+  // Man of the match
   if (perf.manOfTheMatch) pts += 3;
 
-  // cards
+  // Cards
   pts -= 1 * (Number(perf.yellowCards || 0));
   if (perf.redCard) pts -= 3;
 
-  // clean sheet
+  // Clean sheet
   if (started && (posCategory === "GK" || posCategory === "DEF") && Number(concededGoals || 0) === 0) pts += 4;
   if (started && posCategory === "MID" && Number(concededGoals || 0) === 0) pts += 1;
 
-  // conceded penalty for defenders/keepers (optional)
-  if ((posCategory === "GK" || posCategory === "DEF") && Number(concededGoals || 0) > 0) {
-    // example: nothing extra, or -1 per conceded (commented out)
-    // pts -= Number(concededGoals || 0);
+  // Team outcome bonus (apply only if player played)
+  if ((started || subOn) && teamOutcome) {
+    if (teamOutcome === "win") pts += 3;
+    else if (teamOutcome === "draw") pts += 2;
+    else if (teamOutcome === "loss") pts += 1;
   }
 
-  // round to integer
   return Math.round(pts);
 }
 
 /**
  * computePointsForMatch
- * - idempotent: checks existing fantasyStats.match and ft.matchPoints to avoid double-adding
- * - transactional: runs in a mongoose session/transaction
+ *
+ * Main job:
+ * - compute points for players involved in a Match,
+ * - update Player.fantasyStats and Player.totalFantasyPoints,
+ * - update FantasyTeam.matchPoints and gameweek totals and overall points,
+ * - store lineup snapshot if needed.
+ *
+ * Returns an object with summary info on success.
  */
-// computePointsForMatch.js
-
-// computePointsForMatch.js  (drop-in replacement)
 export async function computePointsForMatch(matchId) {
   if (!matchId) throw new Error("matchId required");
 
@@ -760,14 +775,14 @@ export async function computePointsForMatch(matchId) {
 
     if (!match) throw new Error("Match not found: " + matchId);
 
+    // Ensure home/away score are present (your pre-save should compute this)
+    const homeScore = Number(match.homeScore ?? 0);
+    const awayScore = Number(match.awayScore ?? 0);
+
     const homeTeamId = match.homeTeam ? String(match.homeTeam._id) : null;
     const awayTeamId = match.awayTeam ? String(match.awayTeam._id) : null;
 
-    // count goals for conceded logic
-    const homeGoals = (match.goals || []).filter((g) => g.team && String(g.team) === String(homeTeamId)).length;
-    const awayGoals = (match.goals || []).filter((g) => g.team && String(g.team) === String(awayTeamId)).length;
-
-    // build perfByPlayer map (goals, assists, cards, motm, started/subOn)
+    // Build per-player perf map from match events
     const perfByPlayer = {};
     (match.goals || []).forEach((g) => {
       if (g.scorer) {
@@ -779,6 +794,12 @@ export async function computePointsForMatch(matchId) {
         const aid = String(g.assist);
         perfByPlayer[aid] = perfByPlayer[aid] || { goals: 0, assists: 0, yellowCards: 0, redCard: false, manOfTheMatch: false, started: false, subOn: false };
         perfByPlayer[aid].assists += 1;
+      }
+      // ownGoal handling: ownGoal may be recorded using ownBy — leave as is (not credited to scorer)
+      if (g.ownBy) {
+        const oid = String(g.ownBy);
+        perfByPlayer[oid] = perfByPlayer[oid] || { goals: 0, assists: 0, yellowCards: 0, redCard: false, manOfTheMatch: false, started: false, subOn: false };
+        // own goals are typically penalized or treated specially — we won't add positive goals
       }
     });
 
@@ -813,13 +834,16 @@ export async function computePointsForMatch(matchId) {
         perfByPlayer[id] = perfByPlayer[id] || { goals: 0, assists: 0, yellowCards: 0, redCard: false, manOfTheMatch: false, started: false, subOn: false };
         perfByPlayer[id].subOn = true;
       }
+      // If substitution has playerOut, ensure they exist in perf map (they probably do from lineups)
+      if (s.playerOut) {
+        const id = String(s.playerOut);
+        perfByPlayer[id] = perfByPlayer[id] || { goals: 0, assists: 0, yellowCards: 0, redCard: false, manOfTheMatch: false, started: false, subOn: false };
+      }
     });
 
     const playerIds = Object.keys(perfByPlayer);
-
-    // --- determine gameweekNumber robustly (fixture -> gameweek -> number) ---
+    // Determine gameweekNumber
     let gameweekNumber = null;
-
     const fixture = await Fixture.findOne({ match: match._id }).populate("gameweek").lean().exec();
     if (fixture) {
       if (fixture.gameweek && typeof fixture.gameweek === "object" && fixture.gameweek.number != null) {
@@ -829,22 +853,19 @@ export async function computePointsForMatch(matchId) {
         if (gw) gameweekNumber = gw.number;
       }
     }
-
     if (gameweekNumber == null && match.gameweek != null) {
       gameweekNumber = Number(match.gameweek);
     }
-
     if (gameweekNumber == null) {
       const gwDoc = await Gameweek.findOne({ fixtures: match._id }).lean().exec();
       if (gwDoc) gameweekNumber = gwDoc.number;
     }
-
     if (gameweekNumber == null && match.date) {
       const gwByDate = await Gameweek.findOne({ deadline: { $gt: new Date(match.date) } }).sort({ number: 1 }).lean().exec();
       if (gwByDate) gameweekNumber = gwByDate.number;
     }
 
-    // If no players in perf map: set match.gameweek if known, commit and return
+    // if no players in perf map: update match.gameweek if known and return early
     if (playerIds.length === 0) {
       if (gameweekNumber != null) {
         await Match.updateOne({ _id: match._id }, { $set: { gameweek: gameweekNumber } }).session(session).exec();
@@ -854,18 +875,32 @@ export async function computePointsForMatch(matchId) {
       return { success: true, players: 0, gameweekNumber };
     }
 
-    // load player docs
+    // load player docs for metadata (position, team)
     const players = await Player.find({ _id: { $in: playerIds } }).populate("team").lean().exec();
     const playerMap = {};
     players.forEach((p) => { playerMap[String(p._id)] = p; });
 
-    // compute playerPoints (pid -> points)
+    // Determine team outcome per team id: 'win'|'draw'|'loss'
+    const outcomeByTeam = {};
+    if (homeTeamId) {
+      if (homeScore > awayScore) outcomeByTeam[homeTeamId] = "win";
+      else if (homeScore === awayScore) outcomeByTeam[homeTeamId] = "draw";
+      else outcomeByTeam[homeTeamId] = "loss";
+    }
+    if (awayTeamId) {
+      if (awayScore > homeScore) outcomeByTeam[awayTeamId] = "win";
+      else if (awayScore === homeScore) outcomeByTeam[awayTeamId] = "draw";
+      else outcomeByTeam[awayTeamId] = "loss";
+    }
+
+    // compute points per player
     const playerPoints = {};
     for (const pid of playerIds) {
-      const perf = perfByPlayer[pid];
+      const perf = perfByPlayer[pid] || {};
       const p = playerMap[pid];
       if (!p) continue;
 
+      // derive position category
       let posCat = "MID";
       const pos = String(p.position || "").toUpperCase();
       if (pos === "GK") posCat = "GK";
@@ -873,16 +908,24 @@ export async function computePointsForMatch(matchId) {
       else if (["CM", "DM", "AM", "LM", "RM"].some(x => pos.includes(x))) posCat = "MID";
       else if (["ST", "CF", "FW", "LW", "RW"].some(x => pos.includes(x))) posCat = "FWD";
 
+      // conceded goals relative to player's team
       const playerTeamId = p.team ? String(p.team._id ?? p.team) : null;
-      const conceded = (playerTeamId && playerTeamId === String(homeTeamId)) ? awayGoals : homeGoals;
+      let conceded = 0;
+      if (playerTeamId) {
+        if (playerTeamId === homeTeamId) conceded = awayScore;
+        else if (playerTeamId === awayTeamId) conceded = homeScore;
+      }
 
-      const pts = calculatePlayerMatchPoints(perf, posCat, conceded, perf.started, perf.subOn);
+      const teamOutcome = playerTeamId ? outcomeByTeam[playerTeamId] ?? null : null;
+
+      const pts = calculatePlayerMatchPoints(perf, posCat, conceded, perf.started, perf.subOn, teamOutcome);
       playerPoints[pid] = pts;
     }
 
-    // bulk upsert player's fantasyStats with gameweekNumber included (idempotent)
+    // Bulk update Player.fantasyStats and totalFantasyPoints
     const playerBulkOps = [];
     for (const [pid, pts] of Object.entries(playerPoints)) {
+      // push only if not already pushed for this match (idempotent check)
       playerBulkOps.push({
         updateOne: {
           filter: { _id: new mongoose.Types.ObjectId(pid), "fantasyStats.match": { $ne: new mongoose.Types.ObjectId(match._id) } },
@@ -897,31 +940,29 @@ export async function computePointsForMatch(matchId) {
       await Player.bulkWrite(playerBulkOps, { session });
     }
 
-    // find fantasy teams that include any of these players
+    // Find fantasy teams containing any affected players
     const fTeams = await FantasyTeam.find({ "players.player": { $in: playerIds } }).session(session).exec();
-
     const matchFantasyTeamPoints = {};
 
     for (const ft of fTeams) {
-      // skip teams not active for that game's GW
+      // skip teams not active for that GW
       if (ft.effectiveGameweek && gameweekNumber && ft.effectiveGameweek > gameweekNumber) continue;
 
-      // Make a quick map of the fantasy team's roster entries for lookup
+      // build roster map for lookup
       const rosterMap = {};
       for (const pe of ft.players || []) {
         const pid = String(pe.player);
-        rosterMap[pid] = pe; // contains isStarting, position, playerPrice, etc
+        rosterMap[pid] = pe; // contains isStarting, position, etc
       }
 
-      // Build contributors list (only players that are roster members AND either isStarting or actually subOn for this match)
       const contributors = [];
       let teamTotalForMatch = 0;
 
       for (const pid of Object.keys(playerPoints)) {
-        if (!rosterMap[pid]) continue; // ignore players not on this team
+        if (!rosterMap[pid]) continue; // not on this fantasy team
         const pe = rosterMap[pid];
         const perf = perfByPlayer[pid] || {};
-        const played = !!(pe.isStarting || perf.subOn); // include starter OR someone who subbed-on
+        const played = !!(pe.isStarting || perf.subOn); // count starters or those subbed on
         if (!played) continue;
 
         let pPts = Number(playerPoints[pid] || 0);
@@ -940,7 +981,7 @@ export async function computePointsForMatch(matchId) {
         });
       }
 
-      // Save into ft.matchPoints (Map or object) — include contributors array for transparency
+      // Save matchPoints entry keyed by match._id
       const matchKey = String(match._id);
       const matchPointEntry = { points: teamTotalForMatch, gameweek: gameweekNumber, contributors };
 
@@ -951,16 +992,10 @@ export async function computePointsForMatch(matchId) {
         ft.matchPoints[matchKey] = matchPointEntry;
       }
 
-      // Optionally: if team had no contributors (i.e., no players involved) we still set 0 (explicit)
-      // (This prevents accidental omission.)
-      if (!contributors.length) {
-        // teamTotalForMatch is already 0
-      }
-
-      // Recompute gameweekPoints by grouping matchPoints entries
+      // Recompute gameweekPoints aggregator
       const newGwTotals = {};
       if (ft.matchPoints && typeof ft.matchPoints.entries === "function") {
-        for (const [mId, val] of ft.matchPoints.entries()) {
+        for (const [, val] of ft.matchPoints.entries()) {
           const gwKey = val && val.gameweek != null ? String(val.gameweek) : "null";
           newGwTotals[gwKey] = (newGwTotals[gwKey] || 0) + Number(val.points || 0);
         }
@@ -972,7 +1007,6 @@ export async function computePointsForMatch(matchId) {
         }
       }
 
-      // Write gameweekPoints back to ft.gameweekPoints (Map or object)
       if (!ft.gameweekPoints) ft.gameweekPoints = {};
       if (typeof ft.gameweekPoints.set === "function") {
         for (const k of Object.keys(newGwTotals)) {
@@ -987,7 +1021,7 @@ export async function computePointsForMatch(matchId) {
         }
       }
 
-      // recompute team overall points
+      // recompute total points
       let recomputedTotal = 0;
       if (ft.gameweekPoints && typeof ft.gameweekPoints.entries === "function") {
         for (const [, v] of ft.gameweekPoints.entries()) recomputedTotal += Number(v || 0);
@@ -996,7 +1030,7 @@ export async function computePointsForMatch(matchId) {
       }
       ft.points = recomputedTotal;
 
-      // --- starting eleven snapshot for this gameweek (if not present) ---
+      // create lineup snapshot for this gameweek if not present and if current starting XI has 11 players
       try {
         if (gameweekNumber != null) {
           const gwKey = String(gameweekNumber);
@@ -1004,9 +1038,7 @@ export async function computePointsForMatch(matchId) {
             ? ft.lineupSnapshots.has(gwKey)
             : (ft.lineupSnapshots && Object.prototype.hasOwnProperty.call(ft.lineupSnapshots, gwKey));
 
-          // Count current isStarting players on ft.players
           const currentStarting = (ft.players || []).filter(p => !!p.isStarting).map(p => String(p.player));
-
           if (!hasSnapshot && currentStarting.length === 11) {
             const snapshot = {
               starting: currentStarting,
@@ -1022,7 +1054,6 @@ export async function computePointsForMatch(matchId) {
             } else {
               ft.lineupSnapshots[gwKey] = snapshot;
             }
-            // note: we do not alter ft.players[].isStarting flags — only store a snapshot
           }
         }
       } catch (snapErr) {
@@ -1039,11 +1070,10 @@ export async function computePointsForMatch(matchId) {
       matchFantasyTeamPoints[String(ft._id)] = Number(teamTotalForMatch || 0);
     }
 
-    // Update match doc (gameweek & fantasy points map)
+    // Update match doc with fantasy processing info
     const matchUpdate = { fantasyProcessed: true };
     if (gameweekNumber != null) matchUpdate.gameweek = gameweekNumber;
     if (Object.keys(matchFantasyTeamPoints).length > 0) matchUpdate.fantasyTeamPoints = matchFantasyTeamPoints;
-
     await Match.updateOne({ _id: match._id }, { $set: matchUpdate }).session(session).exec();
 
     await session.commitTransaction();
@@ -1051,8 +1081,12 @@ export async function computePointsForMatch(matchId) {
 
     return { success: true, playerPointsCount: Object.keys(playerPoints).length, matchFantasyTeamPoints, gameweekNumber };
   } catch (err) {
-    await session.abortTransaction();
-    session.endSession();
+    try {
+      await session.abortTransaction();
+      session.endSession();
+    } catch (e) {
+      // ignore
+    }
     console.error("[computePointsForMatch] failed:", err);
     throw err;
   }

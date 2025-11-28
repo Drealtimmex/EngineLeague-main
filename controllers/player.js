@@ -218,4 +218,22 @@ export const getAllPlayers = async (req, res, next) => {
   }
 };
   
+  export const deletePlayer = async (req, res, next) => {
+    try {
+      const { id } = req.params;
   
+      const player = await Player.findByIdAndDelete(id);
+  
+      if (!player) {
+        return next(createError(404, "Player not found"));
+      }
+  
+      res.status(200).json({
+        success: true,
+        message: "Player deleted successfully",
+      });
+    } catch (error) {
+      console.error("Error deleting Player:", error);
+      next(createError(500, "Failed to delete Player"));
+    }
+  };
