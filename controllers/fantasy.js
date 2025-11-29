@@ -969,7 +969,7 @@ export async function computePointsForMatch(matchId) {
         const isCaptain = ft.captain && String(ft.captain) === pid;
         const isVice = ft.viceCaptain && String(ft.viceCaptain) === pid;
         if (isCaptain) pPts = pPts * 2;
-
+      else if (isVice) pPts = pPts * 1.5;
         teamTotalForMatch += pPts;
         contributors.push({
           playerId: pid,
@@ -1263,6 +1263,7 @@ export const substitutePlayers = async (req, res) => {
 export const setCaptainVice = async (req, res) => {
   try {
     const userId = req.user?.id;
+    let targetGw = null;
     const { fantasyTeamId, captain, viceCaptain } = req.body;
     if (!fantasyTeamId) return res.status(400).json({ message: "fantasyTeamId is required" });
     if (!Types.ObjectId.isValid(fantasyTeamId)) return res.status(400).json({ message: "Invalid team id" });
@@ -1274,7 +1275,18 @@ export const setCaptainVice = async (req, res) => {
     if (!userId || String(team.user) !== String(userId)) {
       return res.status(403).json({ message: "Forbidden: not team owner" });
     }
+   const upcomingGW = await getUpcomingGameweek();
+      if (!upcomingGW || !upcomingGW.number) return next(createError(400, "No active gameweek"));
+  targetGw = upcomingGW.number;
+    
+    
 
+    // if target is upcoming GW, check deadline guard
+    if (targetGw && upcomingGW && targetGw === upcomingGW.number) {
+      if (!upcomingGW.deadline) return next(createError(400, "No active gameweek deadline"));
+      const now = new Date();
+      if (now >= new Date(upcomingGW.deadline)) return next(createError(403, "Cannot set lineup after deadline for upcoming gameweek"));
+    }
     // Collect starting players ids
     const startingIds = team.players.filter((p) => p.isStarting).map((p) => String(p.player));
 

@@ -32,7 +32,7 @@ router.get("/getAll", verifyToken, getAllUsers);
 router.delete("/:email", verifyToken, deleteUser);
 
 // Reset user password
-router.post("/reset/:email",  resetPassword);
+router.post("/reset/",  resetPassword);
 
 // Recover user password
 router.get("/recover/:email",  recoverPassword);

@@ -190,9 +190,45 @@ export const updateUser = async (req, res, next) => {
     }
   };
   ;
-  
   // Reset User Password
   export const resetPassword = async (req, res, next) => {
+    const {email,newPassword} = req.body
+  
+  
+    const user = await User.findOne({ email }) //get user with this email
+    //authenticate the email and token
+    // if (!user || user.resetPasswordTokenExpiry == null || user.resetPasswordToken != token ) return next(createError(404, "User not found"))
+  
+  
+  
+ 
+  
+    //check if token has expired
+   
+    
+   try {
+  const salt = bcrypt.genSaltSync(10);
+  const hash = bcrypt.hashSync(newPassword,salt)
+  
+  
+    const body ={
+    password:hash}
+    //UPDate the user passwrd in the model
+  const updatedUser = await User.findByIdAndUpdate(
+    user._id,
+    {$set: body},
+    {new: true}// return the updated user
+  )
+  
+  res.status(200).json("password reset successfully")
+    }catch (err) {
+      next(err)
+    }
+  };
+  
+  
+  // Reset User Password
+  export const resetPasswordreal = async (req, res, next) => {
     const {email,token,newPassword} = req.body
   
   
@@ -228,6 +264,8 @@ export const updateUser = async (req, res, next) => {
       next(err)
     }
   };
+  
+
   //get user for signin 
   // get a single user
 export const getSingleUserSignin = async (req, res, next) => {

@@ -237,3 +237,21 @@ export const getAllPlayers = async (req, res, next) => {
       next(createError(500, "Failed to delete Player"));
     }
   };
+  export const updatePlayer = async (req, res) => {
+    try {
+        const { playerId } = req.params;
+        const { ...updateData } = req.body;
+  
+
+        const player = await Player.findById(playerId);
+        if (!player) return res.status(404).json({ message: "Player not found" });
+
+       
+
+        // Update Player
+        const updatedPlayer = await Player.findByIdAndUpdate(playerId, updateData, { new: true });
+        res.status(200).json({ message: "Player updated successfully", player : updatedPlayer });
+    } catch (error) {
+        res.status(500).json({ message: "Server error", error: error.message });
+    }
+};
