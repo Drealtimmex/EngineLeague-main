@@ -1285,7 +1285,7 @@ export const setCaptainVice = async (req, res) => {
     if (targetGw && upcomingGW && targetGw === upcomingGW.number) {
       if (!upcomingGW.deadline) return next(createError(400, "No active gameweek deadline"));
       const now = new Date();
-      if (now >= new Date(upcomingGW.deadline)) return next(createError(403, "Cannot set lineup after deadline for upcoming gameweek"));
+      if (now >= new Date(upcomingGW.deadline))  return res.status(400).json({ message: "Cannot Captain after deadline" });
     }
     // Collect starting players ids
     const startingIds = team.players.filter((p) => p.isStarting).map((p) => String(p.player));
