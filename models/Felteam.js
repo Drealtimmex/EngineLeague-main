@@ -32,6 +32,14 @@ const transfersSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const powerupUsageSchema = new mongoose.Schema(
+  {
+    available: { type: Boolean, default: true },
+    usedGameweek: { type: Number, default: null },
+  },
+  { _id: false }
+);
+
 const fantasyTeamSchema = new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
   teamName: { type: String, required: true },
@@ -47,6 +55,11 @@ const fantasyTeamSchema = new mongoose.Schema({
   effectiveGameweek: { type: Number, default: null },
 
   transfers: { type: transfersSchema, default: () => ({}) },
+  powerups: {
+    wildcard: { type: powerupUsageSchema, default: () => ({}) },
+    benchBoost: { type: powerupUsageSchema, default: () => ({}) },
+    tripleCaptain: { type: powerupUsageSchema, default: () => ({}) },
+  },
 
   // store per-gameweek points breakdown (Map: "1" -> Number)
   gameweekPoints: { type: Map, of: Number, default: {} },

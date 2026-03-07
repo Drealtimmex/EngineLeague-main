@@ -34,6 +34,60 @@ const FWD_MIN = 2;
 const FWD_MAX = 3;
 const MAX_FROM_SAME_TEAM = 3;
 const MAX_FREE_TRANSFERS_PER_GW = 3;
+const POWERUP_KEYS = ["wildcard", "benchBoost", "tripleCaptain"];
+
+function ensurePowerupsShape(teamDoc) {
+  if (!teamDoc.powerups || typeof teamDoc.powerups !== "object") {
+    teamDoc.powerups = {};
+  }
+  for (const key of POWERUP_KEYS) {
+    if (!teamDoc.powerups[key] || typeof teamDoc.powerups[key] !== "object") {
+      teamDoc.powerups[key] = { available: true, usedGameweek: null };
+      continue;
+    }
+    if (typeof teamDoc.powerups[key].available !== "boolean") {
+      teamDoc.powerups[key].available = true;
+    }
+    if (typeof teamDoc.powerups[key].usedGameweek !== "number") {
+      teamDoc.powerups[key].usedGameweek = null;
+    }
+  }
+}
+
+function parsePowerupSelection(raw) {
+  const selected = new Set();
+  if (Array.isArray(raw)) {
+    for (const name of raw) {
+      if (POWERUP_KEYS.includes(name)) selected.add(name);
+    }
+    return selected;
+  }
+  if (raw && typeof raw === "object") {
+    for (const key of POWERUP_KEYS) {
+      if (raw[key]) selected.add(key);
+    }
+  }
+  return selected;
+}
+
+function activatePowerupForGw(teamDoc, powerupKey, gameweekNumber) {
+  ensurePowerupsShape(teamDoc);
+  const slot = teamDoc.powerups[powerupKey];
+  if (slot.available) {
+    slot.available = false;
+    slot.usedGameweek = Number(gameweekNumber);
+    return;
+  }
+  if (Number(slot.usedGameweek) === Number(gameweekNumber)) {
+    return;
+  }
+  throw createError(400, `${powerupKey} has already been used`);
+}
+
+function isPowerupActiveForGw(teamDoc, powerupKey, gameweekNumber) {
+  ensurePowerupsShape(teamDoc);
+  return Number(teamDoc.powerups[powerupKey]?.usedGameweek) === Number(gameweekNumber);
+}
 
 /* -----------------------
    Helpers
@@ -174,6 +228,11 @@ export const createFantasyTeam = async (req, res, next) => {
       transfers: {
         lastResetGw: effectiveGameweek, // track when transfers were last reset
         freeTransfersUsedInGw: 0
+      },
+      powerups: {
+        wildcard: { available: true, usedGameweek: null },
+        benchBoost: { available: true, usedGameweek: null },
+        tripleCaptain: { available: true, usedGameweek: null },
       }
     });
 
@@ -248,7 +307,7 @@ export const editFantasyTeam = async (req, res, next) => {
 export const makeTransfers = async (req, res, next) => {
   try {
     const userId = req.user.id;
-    const { fantasyTeamId, transfers } = req.body;
+    const { fantasyTeamId, transfers, powerups, useWildcard = false } = req.body;
     if (!fantasyTeamId || !Array.isArray(transfers)) {
       return next(createError(400, "fantasyTeamId and transfers required"));
     }
@@ -267,6 +326,19 @@ export const makeTransfers = async (req, res, next) => {
       return next(createError(403, "Transfers are closed for the current gameweek"));
     }
 
+    ensurePowerupsShape(team);
+    const selectedPowerups = parsePowerupSelection(powerups);
+    if (useWildcard) selectedPowerups.add("wildcard");
+    if (selectedPowerups.has("wildcard")) {
+      activatePowerupForGw(team, "wildcard", upcomingGW.number);
+    }
+    if (selectedPowerups.has("benchBoost")) {
+      activatePowerupForGw(team, "benchBoost", upcomingGW.number);
+    }
+    if (selectedPowerups.has("tripleCaptain")) {
+      activatePowerupForGw(team, "tripleCaptain", upcomingGW.number);
+    }
+
     // initialize/reset transfer counters for new gameweek
     if (!team.transfers) team.transfers = { lastResetGw: upcomingGW.number, freeTransfersUsedInGw: 0 };
     if (team.transfers.lastResetGw !== upcomingGW.number) {
@@ -275,8 +347,9 @@ export const makeTransfers = async (req, res, next) => {
     }
 
     const numRequested = transfers.length;
+    const wildcardActive = isPowerupActiveForGw(team, "wildcard", upcomingGW.number);
     const freeLeft = Math.max(0, MAX_FREE_TRANSFERS_PER_GW - (team.transfers.freeTransfersUsedInGw || 0));
-    if (numRequested > freeLeft) {
+    if (!wildcardActive && numRequested > freeLeft) {
       return next(createError(400, `You have ${freeLeft} free transfers left for this gameweek`));
     }
 
@@ -426,7 +499,9 @@ export const makeTransfers = async (req, res, next) => {
     team.players = enriched;
 
     // Update free transfers used
-    team.transfers.freeTransfersUsedInGw = (team.transfers.freeTransfersUsedInGw || 0) + numRequested;
+    if (!wildcardActive) {
+      team.transfers.freeTransfersUsedInGw = (team.transfers.freeTransfersUsedInGw || 0) + numRequested;
+    }
     team.transfers.lastResetGw = upcomingGW.number;
 
     await team.save();
@@ -470,7 +545,7 @@ export const makeTransfers = async (req, res, next) => {
 export const setLineup = async (req, res, next) => {
   try {
     const userId = req.user && (req.user.id || req.user._id);
-    const { fantasyTeamId, startingPlayerIds, captain, viceCaptain, target } = req.body;
+    const { fantasyTeamId, startingPlayerIds, captain, viceCaptain, target, powerups } = req.body;
 
     // basic validation
     if (!fantasyTeamId) return next(createError(400, "fantasyTeamId required"));
@@ -530,6 +605,16 @@ export const setLineup = async (req, res, next) => {
       if (!upcomingGW.deadline) return next(createError(400, "No active gameweek deadline"));
       const now = new Date();
       if (now >= new Date(upcomingGW.deadline)) return next(createError(403, "Cannot set lineup after deadline for upcoming gameweek"));
+    }
+
+    const powerupGw = targetGw || upcomingGW?.number || null;
+    const selectedPowerups = parsePowerupSelection(powerups);
+    if (selectedPowerups.size > 0) {
+      if (!powerupGw) return next(createError(400, "No valid gameweek found for powerup activation"));
+      ensurePowerupsShape(team);
+      for (const key of selectedPowerups) {
+        activatePowerupForGw(team, key, powerupGw);
+      }
     }
 
     // Build map playerId -> position (use position saved on team.players)
@@ -947,6 +1032,9 @@ export async function computePointsForMatch(matchId) {
     for (const ft of fTeams) {
       // skip teams not active for that GW
       if (ft.effectiveGameweek && gameweekNumber && ft.effectiveGameweek > gameweekNumber) continue;
+      ensurePowerupsShape(ft);
+      const benchBoostActive = isPowerupActiveForGw(ft, "benchBoost", gameweekNumber);
+      const tripleCaptainActive = isPowerupActiveForGw(ft, "tripleCaptain", gameweekNumber);
 
       // build roster map for lookup
       const rosterMap = {};
@@ -962,14 +1050,14 @@ export async function computePointsForMatch(matchId) {
         if (!rosterMap[pid]) continue; // not on this fantasy team
         const pe = rosterMap[pid];
         const perf = perfByPlayer[pid] || {};
-        const played = !!(pe.isStarting || perf.subOn); // count starters or those subbed on
+        const played = !!(pe.isStarting || perf.subOn || (benchBoostActive && (perf.started || perf.subOn)));
         if (!played) continue;
 
         let pPts = Number(playerPoints[pid] || 0);
         const isCaptain = ft.captain && String(ft.captain) === pid;
         const isVice = ft.viceCaptain && String(ft.viceCaptain) === pid;
-        if (isCaptain) pPts = pPts * 2;
-      else if (isVice) pPts = pPts * 1.5;
+        if (isCaptain) pPts = pPts * (tripleCaptainActive ? 3 : 2);
+        else if (isVice) pPts = pPts * (tripleCaptainActive ? 2 : 1.5);
         teamTotalForMatch += pPts;
         contributors.push({
           playerId: pid,
@@ -978,6 +1066,8 @@ export async function computePointsForMatch(matchId) {
           isStarting: !!pe.isStarting,
           isCaptain: !!isCaptain,
           isVice: !!isVice,
+          benchBoostActive,
+          tripleCaptainActive,
         });
       }
 
@@ -1260,11 +1350,11 @@ export const substitutePlayers = async (req, res) => {
  * body: { fantasyTeamId, captain?: playerId, viceCaptain?: playerId }
  * Auth: req.user.id must be owner
  */
-export const setCaptainVice = async (req, res) => {
+export const setCaptainVice = async (req, res, next) => {
   try {
     const userId = req.user?.id;
     let targetGw = null;
-    const { fantasyTeamId, captain, viceCaptain } = req.body;
+    const { fantasyTeamId, captain, viceCaptain, powerups } = req.body;
     if (!fantasyTeamId) return res.status(400).json({ message: "fantasyTeamId is required" });
     if (!Types.ObjectId.isValid(fantasyTeamId)) return res.status(400).json({ message: "Invalid team id" });
 
@@ -1275,9 +1365,9 @@ export const setCaptainVice = async (req, res) => {
     if (!userId || String(team.user) !== String(userId)) {
       return res.status(403).json({ message: "Forbidden: not team owner" });
     }
-   const upcomingGW = await getUpcomingGameweek();
-      if (!upcomingGW || !upcomingGW.number) return next(createError(400, "No active gameweek"));
-  targetGw = upcomingGW.number;
+    const upcomingGW = await getUpcomingGameweek();
+    if (!upcomingGW || !upcomingGW.number) return next(createError(400, "No active gameweek"));
+    targetGw = upcomingGW.number;
     
     
 
@@ -1286,6 +1376,14 @@ export const setCaptainVice = async (req, res) => {
       if (!upcomingGW.deadline) return next(createError(400, "No active gameweek deadline"));
       const now = new Date();
       if (now >= new Date(upcomingGW.deadline))  return res.status(400).json({ message: "Cannot Captain after deadline" });
+    }
+
+    const selectedPowerups = parsePowerupSelection(powerups);
+    if (selectedPowerups.size > 0) {
+      ensurePowerupsShape(team);
+      for (const key of selectedPowerups) {
+        activatePowerupForGw(team, key, targetGw);
+      }
     }
     // Collect starting players ids
     const startingIds = team.players.filter((p) => p.isStarting).map((p) => String(p.player));
