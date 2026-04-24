@@ -192,14 +192,17 @@ export const updateUser = async (req, res, next) => {
   ;
   // Reset User Password
 export const resetPassword = async (req, res, next) => {
-  const { email, newPassword } = req.body;
+  const { email, username, identifier, newPassword } = req.body;
+  const loginValue = String(identifier ?? email ?? username ?? "").trim();
 
-  if (!email || !newPassword) {
-    return next(createError(400, "email and newPassword are required"));
+  if (!loginValue || !newPassword) {
+    return next(createError(400, "email or username and newPassword are required"));
   }
 
   try {
-    const user = await User.findOne({ email });
+    const user = await User.findOne({
+      $or: [{ email: loginValue }, { username: loginValue }],
+    });
     if (!user) return next(createError(404, "User not found"));
 
     const salt = bcrypt.genSaltSync(10);

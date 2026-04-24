@@ -43,11 +43,14 @@ function cookieOptions(req) {
  */
 export const signIn = async (req, res, next) => {
   try {
-    const { email, password } = req.body;
-    if (!email) return next(createError(400, "Email is required"));
+    const { email, username, identifier, password } = req.body;
+    const loginValue = String(identifier ?? email ?? username ?? "").trim();
+    if (!loginValue) return next(createError(400, "Email or username is required"));
     if (!password) return next(createError(400, "Password is required"));
 
-    const user = await User.findOne({ email }).select("+password");
+    const user = await User.findOne({
+      $or: [{ email: loginValue }, { username: loginValue }],
+    }).select("+password");
     if (!user) return next(createError(404, "User not found"));
 
     // If user registered via Google only and has no password
