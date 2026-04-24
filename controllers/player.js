@@ -181,16 +181,25 @@ export const getPlayersByTeam = async (req, res, next) => {
 // Get all Players across all Teams with filters (populate team.name)
 export const getAllPlayers = async (req, res, next) => {
   try {
-    const { position, goals, assists, price, yellowCards, redCards } = req.query;
+    const { position, positionCategory, goals, assists, price, yellowCards, redCards, q } = req.query;
 
     // build filters safely (convert numeric strings to numbers)
     const filters = {};
-    if (position) filters.position = position;
+    if (position) {
+      filters.position = position;
+    } else if (positionCategory) {
+      const cat = String(positionCategory).toUpperCase();
+      if (cat === "GK") filters.position = { $in: ["GK"] };
+      else if (cat === "DEF") filters.position = { $in: ["CB", "LB", "RB", "LWB", "RWB", "DEF", "DF", "WB"] };
+      else if (cat === "MID") filters.position = { $in: ["CM", "DM", "AM", "LM", "RM", "MID", "MF"] };
+      else if (cat === "FWD") filters.position = { $in: ["ST", "CF", "FW", "FWD", "LW", "RW", "ATT"] };
+    }
     if (goals) filters.goals = { $gte: Number(goals) };
     if (assists) filters.assists = { $gte: Number(assists) };
     if (price) filters.price = { $lte: Number(price) };
     if (yellowCards) filters.totalyellowCards = { $gte: Number(yellowCards) };
     if (redCards) filters.totalredCards = { $gte: Number(redCards) };
+    if (q) filters.name = { $regex: String(q), $options: "i" };
 
     // sort field
     const sortField = goals

@@ -8,9 +8,9 @@ const router = express.Router();
 router.post("/", verifyToken, createPlayer);
 router.post("/temp", tempcreatePlayer);
 //get
-router.get("/:id", getPlayer);
+router.get("/team/:teamId", getPlayersByTeam);
 router.get("/", getAllPlayers);
-router.get("/team/:teamId",getPlayersByTeam)
+router.get("/:id", getPlayer);
 router.delete("/:id",deletePlayer)
 router.put("/:playerId",updatePlayer)
 

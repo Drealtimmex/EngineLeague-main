@@ -191,40 +191,31 @@ export const updateUser = async (req, res, next) => {
   };
   ;
   // Reset User Password
-  export const resetPassword = async (req, res, next) => {
-    const {email,newPassword} = req.body
-  
-  
-    const user = await User.findOne({ email }) //get user with this email
-    //authenticate the email and token
-    // if (!user || user.resetPasswordTokenExpiry == null || user.resetPasswordToken != token ) return next(createError(404, "User not found"))
-  
-  
-  
- 
-  
-    //check if token has expired
-   
-    
-   try {
-  const salt = bcrypt.genSaltSync(10);
-  const hash = bcrypt.hashSync(newPassword,salt)
-  
-  
-    const body ={
-    password:hash}
-    //UPDate the user passwrd in the model
-  const updatedUser = await User.findByIdAndUpdate(
-    user._id,
-    {$set: body},
-    {new: true}// return the updated user
-  )
-  
-  res.status(200).json("password reset successfully")
-    }catch (err) {
-      next(err)
-    }
-  };
+export const resetPassword = async (req, res, next) => {
+  const { email, newPassword } = req.body;
+
+  if (!email || !newPassword) {
+    return next(createError(400, "email and newPassword are required"));
+  }
+
+  try {
+    const user = await User.findOne({ email });
+    if (!user) return next(createError(404, "User not found"));
+
+    const salt = bcrypt.genSaltSync(10);
+    const hash = bcrypt.hashSync(newPassword, salt);
+
+    await User.findByIdAndUpdate(
+      user._id,
+      { $set: { password: hash } },
+      { new: true }
+    );
+
+    res.status(200).json({ success: true, message: "password reset successfully" });
+  } catch (err) {
+    next(err);
+  }
+};
   
   
   // Reset User Password
