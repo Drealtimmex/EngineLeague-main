@@ -157,6 +157,7 @@ async function getUpcomingGameweek() {
 async function validateAndEnrichSquad(playersInput = [], budget = 150, options = {}) {
   if (!Array.isArray(playersInput)) throw new Error("players must be an array");
   const priceByPlayerId = options?.priceByPlayerId || {};
+  const skipBudgetValidation = options?.skipBudgetValidation === true;
 
   if (playersInput.length !== SQUAD_SIZE) {
     throw createError(400, `Squad must be exactly ${SQUAD_SIZE} players`);
@@ -207,7 +208,9 @@ async function validateAndEnrichSquad(playersInput = [], budget = 150, options =
   if (posCounts.MID < MID_MIN || posCounts.MID > MID_MAX) return { valid: false, message: `Midfielders must be between ${MID_MIN}-${MID_MAX}` };
   if (posCounts.FWD < FWD_MIN || posCounts.FWD > FWD_MAX) return { valid: false, message: `Forwards must be between ${FWD_MIN}-${FWD_MAX}` };
 
-  if (totalPrice > budget) return { valid: false, message: `Total squad cost ${totalPrice} exceeds budget ${budget}` };
+  if (!skipBudgetValidation && totalPrice > budget) {
+    return { valid: false, message: `Total squad cost ${totalPrice} exceeds budget ${budget}` };
+  }
 
   return { valid: true, enriched, totalPrice };
 }
@@ -479,7 +482,10 @@ export const makeTransfers = async (req, res, next) => {
     }
 
     // Run validation/enrichment (this should return { valid: true, enriched: [...] } or { valid:false, message })
-    const validation = await validateAndEnrichSquad(simplifiedPlayers, team.budget, { priceByPlayerId });
+    const validation = await validateAndEnrichSquad(simplifiedPlayers, team.budget, {
+      priceByPlayerId,
+      skipBudgetValidation: true,
+    });
     if (!validation || !validation.valid) {
       const msg = validation && validation.message ? validation.message : "Squad validation failed";
       return next(createError(400, msg));
