@@ -36,6 +36,15 @@ const MAX_FROM_SAME_TEAM = 3;
 const MAX_FREE_TRANSFERS_PER_GW = 3;
 const POWERUP_KEYS = ["wildcard", "benchBoost", "tripleCaptain"];
 
+function normalizePositionCategory(pos) {
+  const q = (pos || "").toUpperCase();
+  if (q === "GK") return "GK";
+  if (["CB", "LB", "RB", "LWB", "RWB", "DEF", "DF", "WB"].includes(q)) return "DEF";
+  if (["CM", "DM", "AM", "LM", "RM", "MID", "MF"].includes(q)) return "MID";
+  if (["ST", "CF", "LW", "RW", "FW", "FWD", "ATT"].includes(q)) return "FWD";
+  return "MID";
+}
+
 function ensurePowerupsShape(teamDoc) {
   if (!teamDoc.powerups || typeof teamDoc.powerups !== "object") {
     teamDoc.powerups = {};
@@ -89,6 +98,24 @@ function isPowerupActiveForGw(teamDoc, powerupKey, gameweekNumber) {
   return Number(teamDoc.powerups[powerupKey]?.usedGameweek) === Number(gameweekNumber);
 }
 
+function getActivePowerupsForGw(teamDoc, gameweekNumber) {
+  ensurePowerupsShape(teamDoc);
+  return POWERUP_KEYS.filter((key) => isPowerupActiveForGw(teamDoc, key, gameweekNumber));
+}
+
+function assertPowerupSelectionAllowed(teamDoc, selectedPowerups, gameweekNumber) {
+  if (!selectedPowerups || selectedPowerups.size === 0) return;
+  if (selectedPowerups.size > 1) {
+    throw createError(400, "Only one powerup can be active in a gameweek");
+  }
+
+  const activePowerups = getActivePowerupsForGw(teamDoc, gameweekNumber);
+  const selectedKey = Array.from(selectedPowerups)[0];
+  if (activePowerups.length > 0 && !activePowerups.includes(selectedKey)) {
+    throw createError(400, `A powerup is already active for gameweek ${gameweekNumber}`);
+  }
+}
+
 /* -----------------------
    Helpers
    ----------------------- */
@@ -127,8 +154,9 @@ async function getUpcomingGameweek() {
  *
  * Also returns enriched players map with position/team info and price to be stored.
  */
-async function validateAndEnrichSquad(playersInput = [], budget = 150) {
+async function validateAndEnrichSquad(playersInput = [], budget = 150, options = {}) {
   if (!Array.isArray(playersInput)) throw new Error("players must be an array");
+  const priceByPlayerId = options?.priceByPlayerId || {};
 
   if (playersInput.length !== SQUAD_SIZE) {
     throw createError(400, `Squad must be exactly ${SQUAD_SIZE} players`);
@@ -147,21 +175,14 @@ async function validateAndEnrichSquad(playersInput = [], budget = 150) {
   let totalPrice = 0;
 
   const enriched = players.map((p) => {
-    // Normalize position categories
-    // Your positions: CB, LB, RB => DEF ; CM, DM, AM => MID ; ST, CF, LW, RW => FWD ; GK => GK
-    let cat;
     const pos = (p.position || "").toUpperCase();
-    if (pos === "GK") cat = "GK";
-    else if (["CB", "LB", "RB"].includes(pos)) cat = "DEF";
-    else if (["CM", "DM", "AM"].includes(pos)) cat = "MID";
-    else if (["ST", "CF", "LW", "RW"].includes(pos)) cat = "FWD";
-    else cat = "MID"; // fallback
+    const cat = normalizePositionCategory(pos);
 
     posCounts[cat] = (posCounts[cat] || 0) + 1;
-    const teamId = p.team ? p.team._id.toString() : "unknown";1
+    const teamId = p.team ? p.team._id.toString() : "unknown";
     teamCounts[teamId] = (teamCounts[teamId] || 0) + 1;
-    // Use player's price at time of signing (player.price); ensure it exists
-    const price = typeof p.price === "number" ? p.price : 10;
+    const customPrice = priceByPlayerId[String(p._id)];
+    const price = typeof customPrice === "number" ? customPrice : (typeof p.price === "number" ? p.price : 10);
     totalPrice += price;
 
     return {
@@ -329,6 +350,7 @@ export const makeTransfers = async (req, res, next) => {
     ensurePowerupsShape(team);
     const selectedPowerups = parsePowerupSelection(powerups);
     if (useWildcard) selectedPowerups.add("wildcard");
+    assertPowerupSelectionAllowed(team, selectedPowerups, upcomingGW.number);
     if (selectedPowerups.has("wildcard")) {
       activatePowerupForGw(team, "wildcard", upcomingGW.number);
     }
@@ -448,9 +470,16 @@ export const makeTransfers = async (req, res, next) => {
 
     // At this point, prepare simplified players array for your validator
     const simplifiedPlayers = newRoster.map((r) => ({ player: String(r.player) }));
+    const priceByPlayerId = {};
+    for (const entry of newRoster) {
+      const pid = String(entry.player);
+      if (typeof entry.playerPrice === "number") {
+        priceByPlayerId[pid] = entry.playerPrice;
+      }
+    }
 
     // Run validation/enrichment (this should return { valid: true, enriched: [...] } or { valid:false, message })
-    const validation = await validateAndEnrichSquad(simplifiedPlayers, team.budget);
+    const validation = await validateAndEnrichSquad(simplifiedPlayers, team.budget, { priceByPlayerId });
     if (!validation || !validation.valid) {
       const msg = validation && validation.message ? validation.message : "Squad validation failed";
       return next(createError(400, msg));
@@ -477,17 +506,9 @@ export const makeTransfers = async (req, res, next) => {
     }
     // Optionally re-check positional composition using enriched entries
     const posCounts = { GK: 0, DEF: 0, MID: 0, FWD: 0 };
-    function normalizeShort(pos) {
-      const q = (pos || "").toUpperCase();
-      if (q === "GK") return "GK";
-      if (["CB", "LB", "RB", "LWB", "RWB"].includes(q)) return "DEF";
-      if (["CM", "DM", "AM", "LM", "RM"].includes(q)) return "MID";
-      if (["ST", "CF", "LW", "RW", "FW"].includes(q)) return "FWD";
-      return "MID";
-    }
     for (const e of enriched) {
       if (!e.isStarting) continue;
-      const cat = normalizeShort(e.position || e.playerPosition || e.pos || e.position);
+      const cat = normalizePositionCategory(e.position || e.playerPosition || e.pos || e.position);
       posCounts[cat] = (posCounts[cat] || 0) + 1;
     }
     if (posCounts.GK !== 1) return next(createError(400, "Starting XI must include exactly 1 GK after transfers"));
@@ -612,6 +633,7 @@ export const setLineup = async (req, res, next) => {
     if (selectedPowerups.size > 0) {
       if (!powerupGw) return next(createError(400, "No valid gameweek found for powerup activation"));
       ensurePowerupsShape(team);
+      assertPowerupSelectionAllowed(team, selectedPowerups, powerupGw);
       for (const key of selectedPowerups) {
         activatePowerupForGw(team, key, powerupGw);
       }
@@ -626,17 +648,9 @@ export const setLineup = async (req, res, next) => {
 
     // formation validation
     const counts = { GK: 0, DEF: 0, MID: 0, FWD: 0 };
-    function normalizePosShort(pos) {
-      const q = (pos || "").toUpperCase();
-      if (q === "GK") return "GK";
-      if (["CB", "LB", "RB", "LWB", "RWB"].includes(q)) return "DEF";
-      if (["CM", "DM", "AM", "LM", "RM"].includes(q)) return "MID";
-      if (["ST", "CF", "LW", "RW", "FW"].includes(q)) return "FWD";
-      return "MID";
-    }
     for (const sid of startingPlayerIds) {
       const pos = posMap[String(sid)];
-      const cat = normalizePosShort(pos);
+      const cat = normalizePositionCategory(pos);
       counts[cat] = (counts[cat] || 0) + 1;
     }
     if (counts.GK !== 1) return next(createError(400, "Starting XI must include exactly 1 GK"));
@@ -714,6 +728,7 @@ export const getAllFantasyTeams = async (req, res, next) => {
     if (userId) filter.user = userId;
     if (competitionId) filter.competitionId = competitionId;
     const teams = await FantasyTeam.find(filter).populate("user", "username email").populate("players.player", "name position team price").exec();
+    teams.forEach((team) => ensurePowerupsShape(team));
     return res.status(200).json({ success: true, data: teams });
   } catch (err) {
     console.error("[getAllFantasyTeams] error:", err);
@@ -729,6 +744,7 @@ export const getFantasyTeamById = async (req, res, next) => {
     const { id } = req.params;
     const team = await FantasyTeam.findById(id).populate("user", "username email").populate("players.player", "name position team price").exec();
     if (!team) return next(createError(404, "Fantasy team not found"));
+    ensurePowerupsShape(team);
     return res.status(200).json({ success: true, data: team });
   } catch (err) {
     console.error("[getFantasyTeamById] error:", err);
@@ -740,6 +756,7 @@ export const getFantasyTeamByLoggedId = async (req, res, next) => {
     const user = req.user.id
     const team = await FantasyTeam.findOne( {user:user}).populate("user", "username email").populate("players.player", "name position team price").exec();
     if (!team) return next(createError(404, "Fantasy team not found"));
+    ensurePowerupsShape(team);
     return res.status(200).json({ success: true, data: team });
   } catch (err) {
     console.error("[getFantasyTeamById] error:", err);
@@ -1057,7 +1074,6 @@ export async function computePointsForMatch(matchId) {
         const isCaptain = ft.captain && String(ft.captain) === pid;
         const isVice = ft.viceCaptain && String(ft.viceCaptain) === pid;
         if (isCaptain) pPts = pPts * (tripleCaptainActive ? 3 : 2);
-        else if (isVice) pPts = pPts * (tripleCaptainActive ? 2 : 1.5);
         teamTotalForMatch += pPts;
         contributors.push({
           playerId: pid,
@@ -1381,6 +1397,7 @@ export const setCaptainVice = async (req, res, next) => {
     const selectedPowerups = parsePowerupSelection(powerups);
     if (selectedPowerups.size > 0) {
       ensurePowerupsShape(team);
+      assertPowerupSelectionAllowed(team, selectedPowerups, targetGw);
       for (const key of selectedPowerups) {
         activatePowerupForGw(team, key, targetGw);
       }

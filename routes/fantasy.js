@@ -18,8 +18,8 @@ const router = express.Router();
 
 // Public reads
 router.get("/", getAllFantasyTeams); // optional query: ?userId=&competitionId=
-router.get("/:id", getFantasyTeamById);
 router.get("/get/team", verifyToken , getFantasyTeamByLoggedId);
+router.get("/:id", getFantasyTeamById);
 router.delete("/", verifyToken , deleteTeam);
 // Protected actions
 router.post("/", verifyToken, createFantasyTeam); // create new fantasy team
