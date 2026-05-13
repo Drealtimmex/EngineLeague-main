@@ -305,6 +305,9 @@ export const createFixturesManually = async (req, res, next) => {
 
     for (const gw of gameweeks) {
       if (!Array.isArray(gw.fixtures)) return next(createError(400, "each gameweek must include fixtures array"));
+      const stage = ["regular", "playoff", "semifinal", "final"].includes(String(gw.stage || "").toLowerCase())
+        ? String(gw.stage).toLowerCase()
+        : "regular";
 
       const fixtureIds = [];
       for (const f of gw.fixtures) {
@@ -342,7 +345,7 @@ export const createFixturesManually = async (req, res, next) => {
         number: nextNumber,
         fixtures: fixtureIds,
         competitionId,
-        stage: "regular",
+        stage,
       });
 
       await Fixture.updateMany({ _id: { $in: fixtureIds } }, { $set: { gameweek: savedGw._id } }).exec();

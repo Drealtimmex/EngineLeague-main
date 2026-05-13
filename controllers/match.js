@@ -38,6 +38,10 @@ function idEquals(a, b) {
   return String(A) === String(B);
 }
 
+function isKnockoutStage(stage) {
+  return ["playoff", "semifinal", "final"].includes(String(stage || "").toLowerCase());
+}
+
 /**
  * updateMatch: full update handler (goals, cards, subs, matchRatings, lineup, bench, manOftheMatch, scalars)
  */
@@ -454,6 +458,10 @@ export const updateMatch = async (req, res, next) => {
       match.fulltime = true;
       await match.save({ session });
 
+      const fixtureDoc = await Fixture.findOne({ match: match._id }).populate("gameweek").session(session).lean().exec();
+      const stage = fixtureDoc?.gameweek?.stage || "regular";
+      const affectsTable = !isKnockoutStage(stage);
+
       const homeTeam = match.homeTeam ? await Team.findById(match.homeTeam).session(session) : null;
       const awayTeam = match.awayTeam ? await Team.findById(match.awayTeam).session(session) : null;
 
@@ -462,28 +470,70 @@ export const updateMatch = async (req, res, next) => {
         const homeGoals = (match.goals || []).filter((g) => g.team && idEquals(g.team, homeTeam._id)).length;
         const awayGoals = (match.goals || []).filter((g) => g.team && idEquals(g.team, awayTeam._id)).length;
 
-        homeTeam.goalsFor = (homeTeam.goalsFor || 0) + homeGoals;
-        homeTeam.goalsAgainst = (homeTeam.goalsAgainst || 0) + awayGoals;
-        awayTeam.goalsFor = (awayTeam.goalsFor || 0) + awayGoals;
-        awayTeam.goalsAgainst = (awayTeam.goalsAgainst || 0) + homeGoals;
+        if (homeTeam.overallMatchesPlayed == null) homeTeam.overallMatchesPlayed = homeTeam.matchesPlayed || 0;
+        if (homeTeam.overallWins == null) homeTeam.overallWins = homeTeam.wins || 0;
+        if (homeTeam.overallDraws == null) homeTeam.overallDraws = homeTeam.draws || 0;
+        if (homeTeam.overallLosses == null) homeTeam.overallLosses = homeTeam.losses || 0;
+        if (homeTeam.overallGoalsFor == null) homeTeam.overallGoalsFor = homeTeam.goalsFor || 0;
+        if (homeTeam.overallGoalsAgainst == null) homeTeam.overallGoalsAgainst = homeTeam.goalsAgainst || 0;
+        if (homeTeam.overallPoints == null) homeTeam.overallPoints = homeTeam.points || 0;
+
+        if (awayTeam.overallMatchesPlayed == null) awayTeam.overallMatchesPlayed = awayTeam.matchesPlayed || 0;
+        if (awayTeam.overallWins == null) awayTeam.overallWins = awayTeam.wins || 0;
+        if (awayTeam.overallDraws == null) awayTeam.overallDraws = awayTeam.draws || 0;
+        if (awayTeam.overallLosses == null) awayTeam.overallLosses = awayTeam.losses || 0;
+        if (awayTeam.overallGoalsFor == null) awayTeam.overallGoalsFor = awayTeam.goalsFor || 0;
+        if (awayTeam.overallGoalsAgainst == null) awayTeam.overallGoalsAgainst = awayTeam.goalsAgainst || 0;
+        if (awayTeam.overallPoints == null) awayTeam.overallPoints = awayTeam.points || 0;
+
+        homeTeam.overallGoalsFor = (homeTeam.overallGoalsFor || 0) + homeGoals;
+        homeTeam.overallGoalsAgainst = (homeTeam.overallGoalsAgainst || 0) + awayGoals;
+        awayTeam.overallGoalsFor = (awayTeam.overallGoalsFor || 0) + awayGoals;
+        awayTeam.overallGoalsAgainst = (awayTeam.overallGoalsAgainst || 0) + homeGoals;
+        if (affectsTable) {
+          homeTeam.goalsFor = (homeTeam.goalsFor || 0) + homeGoals;
+          homeTeam.goalsAgainst = (homeTeam.goalsAgainst || 0) + awayGoals;
+          awayTeam.goalsFor = (awayTeam.goalsFor || 0) + awayGoals;
+          awayTeam.goalsAgainst = (awayTeam.goalsAgainst || 0) + homeGoals;
+        }
 
         if (homeGoals > awayGoals) {
+          homeTeam.overallWins = (homeTeam.overallWins || 0) + 1;
+          homeTeam.overallPoints = (homeTeam.overallPoints || 0) + 3;
+          awayTeam.overallLosses = (awayTeam.overallLosses || 0) + 1;
+          if (affectsTable) {
           homeTeam.wins = (homeTeam.wins || 0) + 1;
           homeTeam.points = (homeTeam.points || 0) + 3;
           awayTeam.losses = (awayTeam.losses || 0) + 1;
+          }
         } else if (homeGoals < awayGoals) {
+          awayTeam.overallWins = (awayTeam.overallWins || 0) + 1;
+          awayTeam.overallPoints = (awayTeam.overallPoints || 0) + 3;
+          homeTeam.overallLosses = (homeTeam.overallLosses || 0) + 1;
+          if (affectsTable) {
           awayTeam.wins = (awayTeam.wins || 0) + 1;
           awayTeam.points = (awayTeam.points || 0) + 3;
           homeTeam.losses = (homeTeam.losses || 0) + 1;
+          }
         } else {
+          homeTeam.overallDraws = (homeTeam.overallDraws || 0) + 1;
+          awayTeam.overallDraws = (awayTeam.overallDraws || 0) + 1;
+          homeTeam.overallPoints = (homeTeam.overallPoints || 0) + 1;
+          awayTeam.overallPoints = (awayTeam.overallPoints || 0) + 1;
+          if (affectsTable) {
           homeTeam.draws = (homeTeam.draws || 0) + 1;
           awayTeam.draws = (awayTeam.draws || 0) + 1;
           homeTeam.points = (homeTeam.points || 0) + 1;
           awayTeam.points = (awayTeam.points || 0) + 1;
+          }
         }
 
+        homeTeam.overallMatchesPlayed = (homeTeam.overallMatchesPlayed || 0) + 1;
+        awayTeam.overallMatchesPlayed = (awayTeam.overallMatchesPlayed || 0) + 1;
+        if (affectsTable) {
         homeTeam.matchesPlayed = (homeTeam.matchesPlayed || 0) + 1;
         awayTeam.matchesPlayed = (awayTeam.matchesPlayed || 0) + 1;
+        }
 
         await homeTeam.save({ session });
         await awayTeam.save({ session });
@@ -683,6 +733,7 @@ export const getMatchesByTeam = async (req, res, next) => {
         return {
           _id: gameweek._id,
           number: gameweek.number,
+          stage: gameweek.stage || "regular",
           deadline: gameweek.deadline || null,
           fixtures: formattedFixtures,
         };

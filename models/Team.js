@@ -14,6 +14,13 @@ const teamSchema = new mongoose.Schema({
   goalsAgainst: { type: Number, default: 0 },
   competitionId:{type: mongoose.Schema.Types.ObjectId, ref:'Competition'},
   points: { type: Number, default: 0 },
+  overallMatchesPlayed: { type: Number, default: 0 },
+  overallWins: { type: Number, default: 0 },
+  overallDraws: { type: Number, default: 0 },
+  overallLosses: { type: Number, default: 0 },
+  overallGoalsFor: { type: Number, default: 0 },
+  overallGoalsAgainst: { type: Number, default: 0 },
+  overallPoints: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now }
 });
 
