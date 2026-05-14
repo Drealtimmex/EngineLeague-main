@@ -34,6 +34,7 @@ const FWD_MIN = 2;
 const FWD_MAX = 3;
 const MAX_FROM_SAME_TEAM = 3;
 const MAX_FREE_TRANSFERS_PER_GW = 3;
+const TRANSFER_LIMITS_ENABLED = false;
 const POWERUP_KEYS = ["wildcard", "benchBoost", "tripleCaptain"];
 const POWERUP_ALIASES = {
   wildcard: "wildcard",
@@ -124,6 +125,14 @@ function activatePowerupForGw(teamDoc, powerupKey, gameweekNumber) {
 function isPowerupActiveForGw(teamDoc, powerupKey, gameweekNumber) {
   ensurePowerupsShape(teamDoc);
   return Number(teamDoc.powerups[powerupKey]?.usedGameweek) === Number(gameweekNumber);
+}
+
+function keepTransferCounterOpenForWildcard(teamDoc) {
+  if (!teamDoc.transfers) return;
+  const used = Number(teamDoc.transfers.freeTransfersUsedInGw || 0);
+  if (used >= MAX_FREE_TRANSFERS_PER_GW) {
+    teamDoc.transfers.freeTransfersUsedInGw = MAX_FREE_TRANSFERS_PER_GW - 1;
+  }
 }
 
 function getActivePowerupsForGw(teamDoc, gameweekNumber) {
@@ -412,8 +421,9 @@ export const makeTransfers = async (req, res, next) => {
 
     const numRequested = transfers.length;
     const wildcardActive = isPowerupActiveForGw(team, "wildcard", upcomingGW.number);
+    if (wildcardActive) keepTransferCounterOpenForWildcard(team);
     const freeLeft = Math.max(0, MAX_FREE_TRANSFERS_PER_GW - (team.transfers.freeTransfersUsedInGw || 0));
-    if (!wildcardActive && numRequested > freeLeft) {
+    if (TRANSFER_LIMITS_ENABLED && !wildcardActive && numRequested > freeLeft) {
       return next(createError(400, `You have ${freeLeft} free transfers left for this gameweek`));
     }
 
@@ -565,7 +575,7 @@ export const makeTransfers = async (req, res, next) => {
     team.players = enriched;
 
     // Update free transfers used
-    if (!wildcardActive) {
+    if (TRANSFER_LIMITS_ENABLED && !wildcardActive) {
       team.transfers.freeTransfersUsedInGw = (team.transfers.freeTransfersUsedInGw || 0) + numRequested;
     }
     team.transfers.lastResetGw = upcomingGW.number;
