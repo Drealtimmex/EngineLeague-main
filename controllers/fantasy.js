@@ -35,6 +35,20 @@ const FWD_MAX = 3;
 const MAX_FROM_SAME_TEAM = 3;
 const MAX_FREE_TRANSFERS_PER_GW = 3;
 const POWERUP_KEYS = ["wildcard", "benchBoost", "tripleCaptain"];
+const POWERUP_ALIASES = {
+  wildcard: "wildcard",
+  wildCard: "wildcard",
+  wild_card: "wildcard",
+  "wild card": "wildcard",
+  benchBoost: "benchBoost",
+  benchboost: "benchBoost",
+  bench_boost: "benchBoost",
+  "bench boost": "benchBoost",
+  tripleCaptain: "tripleCaptain",
+  triplecaptain: "tripleCaptain",
+  triple_captain: "tripleCaptain",
+  "triple captain": "tripleCaptain",
+};
 
 function normalizePositionCategory(pos) {
   const q = (pos || "").toUpperCase();
@@ -63,17 +77,31 @@ function ensurePowerupsShape(teamDoc) {
   }
 }
 
+function normalizePowerupKey(name) {
+  if (typeof name !== "string") return null;
+  const compact = name.trim();
+  return POWERUP_ALIASES[compact] || POWERUP_ALIASES[compact.toLowerCase()] || null;
+}
+
 function parsePowerupSelection(raw) {
   const selected = new Set();
+  if (typeof raw === "string") {
+    const key = normalizePowerupKey(raw);
+    if (key) selected.add(key);
+    return selected;
+  }
   if (Array.isArray(raw)) {
     for (const name of raw) {
-      if (POWERUP_KEYS.includes(name)) selected.add(name);
+      const key = normalizePowerupKey(name);
+      if (key) selected.add(key);
     }
     return selected;
   }
   if (raw && typeof raw === "object") {
-    for (const key of POWERUP_KEYS) {
-      if (raw[key]) selected.add(key);
+    for (const [name, value] of Object.entries(raw)) {
+      if (!value) continue;
+      const key = normalizePowerupKey(name);
+      if (key) selected.add(key);
     }
   }
   return selected;
@@ -331,7 +359,16 @@ export const editFantasyTeam = async (req, res, next) => {
 export const makeTransfers = async (req, res, next) => {
   try {
     const userId = req.user.id;
-    const { fantasyTeamId, transfers, powerups, useWildcard = false } = req.body;
+    const {
+      fantasyTeamId,
+      transfers,
+      powerup,
+      powerups,
+      useWildcard = false,
+      wildcard = false,
+      wildCard = false,
+      wild_card = false,
+    } = req.body;
     if (!fantasyTeamId || !Array.isArray(transfers)) {
       return next(createError(400, "fantasyTeamId and transfers required"));
     }
@@ -352,7 +389,8 @@ export const makeTransfers = async (req, res, next) => {
 
     ensurePowerupsShape(team);
     const selectedPowerups = parsePowerupSelection(powerups);
-    if (useWildcard) selectedPowerups.add("wildcard");
+    for (const key of parsePowerupSelection(powerup)) selectedPowerups.add(key);
+    if (useWildcard || wildcard || wildCard || wild_card) selectedPowerups.add("wildcard");
     assertPowerupSelectionAllowed(team, selectedPowerups, upcomingGW.number);
     if (selectedPowerups.has("wildcard")) {
       activatePowerupForGw(team, "wildcard", upcomingGW.number);
@@ -363,6 +401,7 @@ export const makeTransfers = async (req, res, next) => {
     if (selectedPowerups.has("tripleCaptain")) {
       activatePowerupForGw(team, "tripleCaptain", upcomingGW.number);
     }
+    team.markModified("powerups");
 
     // initialize/reset transfer counters for new gameweek
     if (!team.transfers) team.transfers = { lastResetGw: upcomingGW.number, freeTransfersUsedInGw: 0 };
@@ -572,7 +611,7 @@ export const makeTransfers = async (req, res, next) => {
 export const setLineup = async (req, res, next) => {
   try {
     const userId = req.user && (req.user.id || req.user._id);
-    const { fantasyTeamId, startingPlayerIds, captain, viceCaptain, target, powerups } = req.body;
+    const { fantasyTeamId, startingPlayerIds, captain, viceCaptain, target, powerup, powerups } = req.body;
 
     // basic validation
     if (!fantasyTeamId) return next(createError(400, "fantasyTeamId required"));
@@ -636,6 +675,7 @@ export const setLineup = async (req, res, next) => {
 
     const powerupGw = targetGw || upcomingGW?.number || null;
     const selectedPowerups = parsePowerupSelection(powerups);
+    for (const key of parsePowerupSelection(powerup)) selectedPowerups.add(key);
     if (selectedPowerups.size > 0) {
       if (!powerupGw) return next(createError(400, "No valid gameweek found for powerup activation"));
       ensurePowerupsShape(team);
@@ -643,6 +683,7 @@ export const setLineup = async (req, res, next) => {
       for (const key of selectedPowerups) {
         activatePowerupForGw(team, key, powerupGw);
       }
+      team.markModified("powerups");
     }
 
     // Build map playerId -> position (use position saved on team.players)
@@ -1376,7 +1417,7 @@ export const setCaptainVice = async (req, res, next) => {
   try {
     const userId = req.user?.id;
     let targetGw = null;
-    const { fantasyTeamId, captain, viceCaptain, powerups } = req.body;
+    const { fantasyTeamId, captain, viceCaptain, powerup, powerups } = req.body;
     if (!fantasyTeamId) return res.status(400).json({ message: "fantasyTeamId is required" });
     if (!Types.ObjectId.isValid(fantasyTeamId)) return res.status(400).json({ message: "Invalid team id" });
 
@@ -1401,12 +1442,14 @@ export const setCaptainVice = async (req, res, next) => {
     }
 
     const selectedPowerups = parsePowerupSelection(powerups);
+    for (const key of parsePowerupSelection(powerup)) selectedPowerups.add(key);
     if (selectedPowerups.size > 0) {
       ensurePowerupsShape(team);
       assertPowerupSelectionAllowed(team, selectedPowerups, targetGw);
       for (const key of selectedPowerups) {
         activatePowerupForGw(team, key, targetGw);
       }
+      team.markModified("powerups");
     }
     // Collect starting players ids
     const startingIds = team.players.filter((p) => p.isStarting).map((p) => String(p.player));
