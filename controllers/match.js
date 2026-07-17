@@ -4,6 +4,7 @@ import User from "../models/User.js";
 import Gameweek from "../models/Gameweek.js";
 import Fixture from "../models/Fixtures.js"
 import Team from "../models/Team.js";
+import FantasyTeam from "../models/Felteam.js";
 import { computePointsForMatch } from "./fantasy.js";
 
 import Player from "../models/Player.js" // Import User model if not already imported
@@ -41,6 +42,218 @@ function idEquals(a, b) {
 function isKnockoutStage(stage) {
   return ["playoff", "semifinal", "final"].includes(String(stage || "").toLowerCase());
 }
+
+function asNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function subtractNonNegative(current, delta) {
+  return Math.max(0, asNumber(current) - asNumber(delta));
+}
+
+async function getMatchStage(matchId, session) {
+  const fixtureDoc = await Fixture.findOne({ match: matchId }).populate("gameweek").session(session).lean().exec();
+  return fixtureDoc?.gameweek?.stage || "regular";
+}
+
+async function revertFantasyForMatch(match, session) {
+  const matchId = String(match._id);
+
+  const players = await Player.find({ "fantasyStats.match": match._id }).session(session).exec();
+  let revertedPlayerCount = 0;
+
+  for (const player of players) {
+    const removedEntries = (player.fantasyStats || []).filter((entry) => String(entry.match) === matchId);
+    if (!removedEntries.length) continue;
+
+    const removedPoints = removedEntries.reduce((sum, entry) => sum + asNumber(entry.points), 0);
+    player.fantasyStats = (player.fantasyStats || []).filter((entry) => String(entry.match) !== matchId);
+    player.totalFantasyPoints = subtractNonNegative(player.totalFantasyPoints, removedPoints);
+    await player.save({ session });
+    revertedPlayerCount += 1;
+  }
+
+  const fantasyTeams = await FantasyTeam.find({ [`matchPoints.${matchId}`]: { $exists: true } }).session(session).exec();
+  let revertedFantasyTeamCount = 0;
+
+  for (const team of fantasyTeams) {
+    const matchPointsObj =
+      typeof team.matchPoints?.get === "function"
+        ? Object.fromEntries(team.matchPoints.entries())
+        : { ...(team.matchPoints || {}) };
+
+    if (!Object.prototype.hasOwnProperty.call(matchPointsObj, matchId)) continue;
+
+    delete matchPointsObj[matchId];
+
+    const newGwTotals = {};
+    for (const value of Object.values(matchPointsObj)) {
+      const gwKey = value && value.gameweek != null ? String(value.gameweek) : null;
+      if (!gwKey) continue;
+      newGwTotals[gwKey] = asNumber(newGwTotals[gwKey]) + asNumber(value.points);
+    }
+
+    team.matchPoints = matchPointsObj;
+    team.gameweekPoints = newGwTotals;
+    team.points = Object.values(newGwTotals).reduce((sum, pts) => sum + asNumber(pts), 0);
+
+    if (typeof team.markModified === "function") {
+      team.markModified("matchPoints");
+      team.markModified("gameweekPoints");
+    }
+
+    await team.save({ session });
+    revertedFantasyTeamCount += 1;
+  }
+
+  match.fantasyProcessed = false;
+  match.fantasyTeamPoints = {};
+
+  return { revertedPlayerCount, revertedFantasyTeamCount };
+}
+
+async function revertStandingsForMatch(match, session) {
+  const homeTeam = match.homeTeam ? await Team.findById(match.homeTeam).session(session) : null;
+  const awayTeam = match.awayTeam ? await Team.findById(match.awayTeam).session(session) : null;
+
+  if (!homeTeam || !awayTeam) {
+    return { standingsReverted: false };
+  }
+
+  const stage = await getMatchStage(match._id, session);
+  const affectsTable = !isKnockoutStage(stage);
+  const homeGoals = (match.goals || []).filter((g) => g.team && idEquals(g.team, homeTeam._id)).length;
+  const awayGoals = (match.goals || []).filter((g) => g.team && idEquals(g.team, awayTeam._id)).length;
+
+  homeTeam.overallGoalsFor = subtractNonNegative(homeTeam.overallGoalsFor, homeGoals);
+  homeTeam.overallGoalsAgainst = subtractNonNegative(homeTeam.overallGoalsAgainst, awayGoals);
+  awayTeam.overallGoalsFor = subtractNonNegative(awayTeam.overallGoalsFor, awayGoals);
+  awayTeam.overallGoalsAgainst = subtractNonNegative(awayTeam.overallGoalsAgainst, homeGoals);
+  homeTeam.overallMatchesPlayed = subtractNonNegative(homeTeam.overallMatchesPlayed, 1);
+  awayTeam.overallMatchesPlayed = subtractNonNegative(awayTeam.overallMatchesPlayed, 1);
+
+  if (affectsTable) {
+    homeTeam.goalsFor = subtractNonNegative(homeTeam.goalsFor, homeGoals);
+    homeTeam.goalsAgainst = subtractNonNegative(homeTeam.goalsAgainst, awayGoals);
+    awayTeam.goalsFor = subtractNonNegative(awayTeam.goalsFor, awayGoals);
+    awayTeam.goalsAgainst = subtractNonNegative(awayTeam.goalsAgainst, homeGoals);
+    homeTeam.matchesPlayed = subtractNonNegative(homeTeam.matchesPlayed, 1);
+    awayTeam.matchesPlayed = subtractNonNegative(awayTeam.matchesPlayed, 1);
+  }
+
+  if (homeGoals > awayGoals) {
+    homeTeam.overallWins = subtractNonNegative(homeTeam.overallWins, 1);
+    homeTeam.overallPoints = subtractNonNegative(homeTeam.overallPoints, 3);
+    awayTeam.overallLosses = subtractNonNegative(awayTeam.overallLosses, 1);
+    if (affectsTable) {
+      homeTeam.wins = subtractNonNegative(homeTeam.wins, 1);
+      homeTeam.points = subtractNonNegative(homeTeam.points, 3);
+      awayTeam.losses = subtractNonNegative(awayTeam.losses, 1);
+    }
+  } else if (homeGoals < awayGoals) {
+    awayTeam.overallWins = subtractNonNegative(awayTeam.overallWins, 1);
+    awayTeam.overallPoints = subtractNonNegative(awayTeam.overallPoints, 3);
+    homeTeam.overallLosses = subtractNonNegative(homeTeam.overallLosses, 1);
+    if (affectsTable) {
+      awayTeam.wins = subtractNonNegative(awayTeam.wins, 1);
+      awayTeam.points = subtractNonNegative(awayTeam.points, 3);
+      homeTeam.losses = subtractNonNegative(homeTeam.losses, 1);
+    }
+  } else {
+    homeTeam.overallDraws = subtractNonNegative(homeTeam.overallDraws, 1);
+    awayTeam.overallDraws = subtractNonNegative(awayTeam.overallDraws, 1);
+    homeTeam.overallPoints = subtractNonNegative(homeTeam.overallPoints, 1);
+    awayTeam.overallPoints = subtractNonNegative(awayTeam.overallPoints, 1);
+    if (affectsTable) {
+      homeTeam.draws = subtractNonNegative(homeTeam.draws, 1);
+      awayTeam.draws = subtractNonNegative(awayTeam.draws, 1);
+      homeTeam.points = subtractNonNegative(homeTeam.points, 1);
+      awayTeam.points = subtractNonNegative(awayTeam.points, 1);
+    }
+  }
+
+  await homeTeam.save({ session });
+  await awayTeam.save({ session });
+
+  return { standingsReverted: true, affectsTable, homeGoals, awayGoals };
+}
+
+export const revertMatchFulltime = async (req, res, next) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      await session.abortTransaction();
+      session.endSession();
+      return next(createError(401, "Not authenticated"));
+    }
+
+    const user = await User.findById(userId).session(session).lean().exec();
+    if (!user) {
+      await session.abortTransaction();
+      session.endSession();
+      return next(createError(404, "User not found"));
+    }
+    if (user.role !== "admin") {
+      await session.abortTransaction();
+      session.endSession();
+      return next(createError(403, "You are not authorized to revert matches"));
+    }
+
+    const matchId = req.params.id || req.body.matchId;
+    if (!matchId || !isValidId(matchId)) {
+      await session.abortTransaction();
+      session.endSession();
+      return next(createError(400, "Valid matchId is required"));
+    }
+
+    const match = await Match.findById(matchId).session(session);
+    if (!match) {
+      await session.abortTransaction();
+      session.endSession();
+      return next(createError(404, "Match not found"));
+    }
+
+    const wasFulltime = !!match.fulltime;
+    const standingsResult = wasFulltime
+      ? await revertStandingsForMatch(match, session)
+      : { standingsReverted: false };
+    const fantasyResult = await revertFantasyForMatch(match, session);
+
+    match.fulltime = false;
+    if (typeof match.recomputeScoresFromGoals === "function") {
+      match.recomputeScoresFromGoals();
+    }
+    await match.save({ session });
+
+    await session.commitTransaction();
+    session.endSession();
+
+    return res.status(200).json({
+      success: true,
+      message: "Match full-time status and fantasy points reverted",
+      data: {
+        matchId: String(match._id),
+        wasFulltime,
+        fulltime: false,
+        ...standingsResult,
+        ...fantasyResult,
+      },
+    });
+  } catch (error) {
+    try {
+      await session.abortTransaction();
+    } catch (e) {
+      /* ignore */
+    }
+    session.endSession();
+    console.error("Error reverting match fulltime:", error);
+    return next(createError(500, "Error reverting match fulltime"));
+  }
+};
 
 /**
  * updateMatch: full update handler (goals, cards, subs, matchRatings, lineup, bench, manOftheMatch, scalars)
