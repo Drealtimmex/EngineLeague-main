@@ -32,7 +32,7 @@ const MID_MIN = 4;
 const MID_MAX = 5;
 const FWD_MIN = 2;
 const FWD_MAX = 3;
-const MAX_FROM_SAME_TEAM = 3;
+const MAX_FROM_SAME_TEAM = 7;
 const MAX_FREE_TRANSFERS_PER_GW = 3;
 const TRANSFER_LIMITS_ENABLED = false;
 const POWERUP_KEYS = ["wildcard", "benchBoost", "tripleCaptain"];
@@ -507,15 +507,15 @@ export const makeTransfers = async (req, res, next) => {
       return next(createError(400, "Roster size mismatch after applying transfers"));
     }
 
-    // Validate "max 3 from same real-world team"
+    // Validate max players from the same real-world team
     const teamCounts = new Map();
     for (const r of newRoster) {
       const teamIdStr = r.team ? String(r.team) : null;
       if (!teamIdStr) continue;
       const cur = teamCounts.get(teamIdStr) || 0;
       const nextCount = cur + 1;
-      if (nextCount > 3) {
-        return next(createError(400, "A fantasy team cannot have more than 3 players from the same real-world team"));
+      if (nextCount > MAX_FROM_SAME_TEAM) {
+        return next(createError(400, `A fantasy team cannot have more than ${MAX_FROM_SAME_TEAM} players from the same real-world team`));
       }
       teamCounts.set(teamIdStr, nextCount);
     }
@@ -1124,7 +1124,7 @@ export async function computePointsForMatch(matchId) {
         if (!rosterMap[pid]) continue; // not on this fantasy team
         const pe = rosterMap[pid];
         const perf = perfByPlayer[pid] || {};
-        const played = !!(pe.isStarting || perf.subOn || (benchBoostActive && (perf.started || perf.subOn)));
+        const played = !!(benchBoostActive || pe.isStarting);
         if (!played) continue;
 
         let pPts = Number(playerPoints[pid] || 0);
