@@ -142,14 +142,14 @@ function getActivePowerupsForGw(teamDoc, gameweekNumber) {
 
 function assertPowerupSelectionAllowed(teamDoc, selectedPowerups, gameweekNumber) {
   if (!selectedPowerups || selectedPowerups.size === 0) return;
-  if (selectedPowerups.size > 1) {
-    throw createError(400, "Only one powerup can be active in a gameweek");
-  }
+  ensurePowerupsShape(teamDoc);
 
-  const activePowerups = getActivePowerupsForGw(teamDoc, gameweekNumber);
-  const selectedKey = Array.from(selectedPowerups)[0];
-  if (activePowerups.length > 0 && !activePowerups.includes(selectedKey)) {
-    throw createError(400, `A powerup is already active for gameweek ${gameweekNumber}`);
+  for (const key of selectedPowerups) {
+    const slot = teamDoc.powerups[key];
+    const activeThisGw = Number(slot?.usedGameweek) === Number(gameweekNumber);
+    if (slot?.available === false && !activeThisGw) {
+      throw createError(400, `${key} has already been used`);
+    }
   }
 }
 
