@@ -695,7 +695,7 @@ export const makeTransfers = async (req, res, next) => {
     const populated = await FantasyTeam.findById(team._id)
       .populate({
         path: "players.player",
-        select: "name position price fantasyStats team teamLogo totalFantasyPoints",
+        select: "name position price fantasyStats team teamLogo totalFantasyPoints playerPic",
         populate: { path: "team", select: "name _id" },
       })
       .populate({ path: "user", select: "username email _id" })
@@ -860,7 +860,7 @@ export const setLineup = async (req, res, next) => {
     const populated = await FantasyTeam.findById(team._id)
       .populate({
         path: "players.player",
-        select: "name position price fantasyStats team teamLogo",
+        select: "name position price fantasyStats team teamLogo playerPic",
         populate: { path: "team", select: "name _id" },
       })
       .populate({ path: "user", select: "username email _id" })
@@ -885,7 +885,7 @@ export const getAllFantasyTeams = async (req, res, next) => {
     const filter = {};
     if (userId) filter.user = userId;
     if (competitionId) filter.competitionId = competitionId;
-    const teams = await FantasyTeam.find(filter).populate("user", "username email").populate("players.player", "name position team price").exec();
+    const teams = await FantasyTeam.find(filter).populate("user", "username email").populate("players.player", "name position team price playerPic").exec();
     teams.forEach((team) => ensurePowerupsShape(team));
     return res.status(200).json({ success: true, data: teams });
   } catch (err) {
@@ -900,7 +900,7 @@ export const getAllFantasyTeams = async (req, res, next) => {
 export const getFantasyTeamById = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const team = await FantasyTeam.findById(id).populate("user", "username email").populate("players.player", "name position team price").exec();
+    const team = await FantasyTeam.findById(id).populate("user", "username email").populate("players.player", "name position team price playerPic").exec();
     if (!team) return next(createError(404, "Fantasy team not found"));
     ensurePowerupsShape(team);
     return res.status(200).json({ success: true, data: team });
@@ -942,7 +942,7 @@ export const getFantasyTeamByLoggedId = async (req, res, next) => {
     }
     if (!team) return next(createError(404, "Fantasy team not found"));
     await team.populate("user", "username email");
-    await team.populate("players.player", "name position team price");
+    await team.populate("players.player", "name position team price playerPic");
     ensurePowerupsShape(team);
     return res.status(200).json({ success: true, data: team });
   } catch (err) {
