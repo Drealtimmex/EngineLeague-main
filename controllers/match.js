@@ -9,6 +9,7 @@ import { computePointsForMatch } from "./fantasy.js";
 
 import Player from "../models/Player.js" // Import User model if not already imported
 import { createError } from "../error.js";
+import { publishMatchUpdate } from "../utils/liveMatchEvents.js";
 // your function if any
 
 
@@ -59,6 +60,8 @@ async function getMatchStage(matchId, session) {
 
 async function revertFantasyForMatch(match, session) {
   const matchId = String(match._id);
+  const fixture = await Fixture.findOne({ match: match._id }).populate("gameweek", "number competitionId").session(session).lean().exec();
+  const revertedGameweek = Number(fixture?.gameweek?.number || match.gameweek || 0) || null;
 
   const players = await Player.find({ "fantasyStats.match": match._id }).session(session).exec();
   let revertedPlayerCount = 0;
@@ -70,6 +73,19 @@ async function revertFantasyForMatch(match, session) {
     const removedPoints = removedEntries.reduce((sum, entry) => sum + asNumber(entry.points), 0);
     player.fantasyStats = (player.fantasyStats || []).filter((entry) => String(entry.match) !== matchId);
     player.totalFantasyPoints = subtractNonNegative(player.totalFantasyPoints, removedPoints);
+    for (const entry of removedEntries) {
+      if (!entry.competitionId) continue;
+      const key = String(entry.competitionId);
+      const current = typeof player.competitionFantasyPoints?.get === "function"
+        ? player.competitionFantasyPoints.get(key)
+        : player.competitionFantasyPoints?.[key];
+      if (typeof player.competitionFantasyPoints?.set === "function") {
+        player.competitionFantasyPoints.set(key, subtractNonNegative(current, entry.points));
+      } else {
+        player.competitionFantasyPoints = { ...(player.competitionFantasyPoints || {}), [key]: subtractNonNegative(current, entry.points) };
+      }
+    }
+    player.markModified?.("competitionFantasyPoints");
     await player.save({ session });
     revertedPlayerCount += 1;
   }
@@ -87,6 +103,22 @@ async function revertFantasyForMatch(match, session) {
 
     delete matchPointsObj[matchId];
 
+    // Undo any automatic substitutions/vice-captain resolution that was
+    // applied after this gameweek finished; the remaining matches will be
+    // rescored below against the original locked lineup.
+    if (revertedGameweek) {
+      const key = String(revertedGameweek);
+      const map = team.lineupSnapshots;
+      const prior = typeof map?.get === "function" ? map.get(key) : map?.[key];
+      if (prior) {
+        const snapshot = prior.toObject ? prior.toObject() : { ...prior };
+        delete snapshot.resolvedStarting;
+        delete snapshot.resolvedCaptain;
+        if (typeof map?.set === "function") map.set(key, snapshot);
+        else team.lineupSnapshots = { ...(team.lineupSnapshots || {}), [key]: snapshot };
+      }
+    }
+
     const newGwTotals = {};
     for (const value of Object.values(matchPointsObj)) {
       const gwKey = value && value.gameweek != null ? String(value.gameweek) : null;
@@ -101,6 +133,7 @@ async function revertFantasyForMatch(match, session) {
     if (typeof team.markModified === "function") {
       team.markModified("matchPoints");
       team.markModified("gameweekPoints");
+      team.markModified("lineupSnapshots");
     }
 
     await team.save({ session });
@@ -110,7 +143,7 @@ async function revertFantasyForMatch(match, session) {
   match.fantasyProcessed = false;
   match.fantasyTeamPoints = {};
 
-  return { revertedPlayerCount, revertedFantasyTeamCount };
+  return { revertedPlayerCount, revertedFantasyTeamCount, revertedGameweek, competitionId: fixture?.competitionId || fixture?.gameweek?.competitionId || null };
 }
 
 async function revertStandingsForMatch(match, session) {
@@ -121,6 +154,12 @@ async function revertStandingsForMatch(match, session) {
     return { standingsReverted: false };
   }
 
+  const fixture = await Fixture.findOne({ match: match._id }).session(session).lean().exec();
+  // A prior season's table is frozen at rollover. Reverting an old match must
+  // not subtract its result from the live season counters.
+  if (fixture?.competitionId && homeTeam.competitionId && String(fixture.competitionId) !== String(homeTeam.competitionId)) {
+    return { standingsReverted: false, archivedSeason: true };
+  }
   const stage = await getMatchStage(match._id, session);
   const affectsTable = !isKnockoutStage(stage);
   const homeGoals = (match.goals || []).filter((g) => g.team && idEquals(g.team, homeTeam._id)).length;
@@ -231,6 +270,18 @@ export const revertMatchFulltime = async (req, res, next) => {
 
     await session.commitTransaction();
     session.endSession();
+
+    if (fantasyResult.revertedGameweek && fantasyResult.competitionId) {
+      const fixtureRows = await Fixture.find({ competitionId: fantasyResult.competitionId }).populate("gameweek", "number").select("match gameweek").lean().exec();
+      const replayIds = fixtureRows.filter((row) => Number(row.gameweek?.number) === fantasyResult.revertedGameweek && row.match && String(row.match) !== String(match._id)).map((row) => row.match);
+      const replayMatches = await Match.find({ _id: { $in: replayIds }, fulltime: true }).select("_id").lean().exec();
+      for (const replay of replayMatches) {
+        try { await computePointsForMatch(replay._id); }
+        catch (error) { console.error("Error rebuilding fantasy totals after full-time revert:", error); }
+      }
+    }
+
+    publishMatchUpdate(match._id, { matchId: String(match._id), type: "fulltime-reverted", updatedAt: new Date().toISOString() });
 
     return res.status(200).json({
       success: true,
@@ -521,6 +572,8 @@ export const updateMatch = async (req, res, next) => {
     //      updateData.bench = { home: [ids|obj], away: [ids|obj] }
     // --------------------------
     if (updateData.lineups && typeof updateData.lineups === "object") {
+      const oldHomeLineup = (match.lineups?.home || []).map((id) => String(id?._id || id));
+      const oldAwayLineup = (match.lineups?.away || []).map((id) => String(id?._id || id));
       // normalize arrays of ids
       const homeArr = Array.isArray(updateData.lineups.home)
         ? updateData.lineups.home.map((x) => (typeof x === "object" && x._id ? x._id : x)).filter(isValidId).map(toObjectId)
@@ -550,6 +603,34 @@ export const updateMatch = async (req, res, next) => {
       if (Array.isArray(awayArr)) {
         for (const pid of awayArr) await ensurePerfFor(pid);
       }
+
+      const removeUnusedAppearance = async (playerId) => {
+        const id = String(playerId);
+        const stillInLineup = [...(match.lineups?.home || []), ...(match.lineups?.away || [])].some((entry) => String(entry?._id || entry) === id);
+        const hasMatchAction = (match.goals || []).some((event) => [event.scorer, event.assist, event.ownBy].some((entry) => entry && String(entry?._id || entry) === id))
+          || (match.cards || []).some((event) => String(event.player?._id || event.player) === id)
+          || (match.substitutions || []).some((event) => [event.playerIn, event.playerOut].some((entry) => entry && String(entry?._id || entry) === id))
+          || String(match.manOftheMatch?._id || match.manOftheMatch || "") === id;
+        if (stillInLineup || hasMatchAction) return;
+        const player = await Player.findById(playerId).session(session);
+        if (!player) return;
+        const countBefore = (player.matchPerformances || []).length;
+        player.matchPerformances = (player.matchPerformances || []).filter((performance) => String(performance.match) !== String(match._id));
+        if (player.matchPerformances.length !== countBefore) await player.save({ session });
+      };
+      const homeNow = new Set((match.lineups?.home || []).map((id) => String(id?._id || id)));
+      const awayNow = new Set((match.lineups?.away || []).map((id) => String(id?._id || id)));
+      for (const id of oldHomeLineup) if (Array.isArray(homeArr) && !homeNow.has(id)) await removeUnusedAppearance(id);
+      for (const id of oldAwayLineup) if (Array.isArray(awayArr) && !awayNow.has(id)) await removeUnusedAppearance(id);
+    }
+
+    if (updateData.formations && typeof updateData.formations === "object") {
+      const allowedFormations = new Set(["", "4-4-2", "4-3-3", "4-2-3-1", "4-5-1", "3-5-2", "3-4-3", "5-3-2", "5-4-1"]);
+      match.formations = match.formations || {};
+      for (const side of ["home", "away"]) {
+        const formation = String(updateData.formations[side] || "");
+        if (allowedFormations.has(formation)) match.formations[side] = formation;
+      }
     }
 
     if (updateData.bench && typeof updateData.bench === "object") {
@@ -564,22 +645,27 @@ export const updateMatch = async (req, res, next) => {
       if (Array.isArray(homeBenchArr)) match.bench.home = homeBenchArr;
       if (Array.isArray(awayBenchArr)) match.bench.away = awayBenchArr;
 
-      // ensure bench players also have matchPerformances entry (optional but useful)
-      const ensurePerfFor = async (playerId) => {
+      // A named substitute has not appeared until they are actually used.
+      const removeUnusedBenchEntry = async (playerId) => {
         if (!playerId) return;
         const pl = await Player.findById(playerId).session(session);
         if (!pl) return;
-        let perf = (pl.matchPerformances || []).find((p) => p.match && String(p.match) === String(match._id));
-        if (!perf) {
-          pl.matchPerformances = (pl.matchPerformances || []).concat([{ match: match._id }]);
-          await pl.save({ session });
-        }
+        const id = String(playerId);
+        const inStartingXI = [...(match.lineups?.home || []), ...(match.lineups?.away || [])].some((entry) => String(entry?._id || entry) === id);
+        const hasAction = (match.goals || []).some((event) => [event.scorer, event.assist, event.ownBy].some((entry) => entry && String(entry?._id || entry) === id))
+          || (match.cards || []).some((event) => String(event.player?._id || event.player) === id)
+          || (match.substitutions || []).some((event) => [event.playerIn, event.playerOut].some((entry) => entry && String(entry?._id || entry) === id))
+          || String(match.manOftheMatch?._id || match.manOftheMatch || "") === id;
+        if (inStartingXI || hasAction) return;
+        const before = (pl.matchPerformances || []).length;
+        pl.matchPerformances = (pl.matchPerformances || []).filter((performance) => String(performance.match) !== String(match._id));
+        if (pl.matchPerformances.length !== before) await pl.save({ session });
       };
       if (Array.isArray(homeBenchArr)) {
-        for (const pid of homeBenchArr) await ensurePerfFor(pid);
+        for (const pid of homeBenchArr) await removeUnusedBenchEntry(pid);
       }
       if (Array.isArray(awayBenchArr)) {
-        for (const pid of awayBenchArr) await ensurePerfFor(pid);
+        for (const pid of awayBenchArr) await removeUnusedBenchEntry(pid);
       }
     }
 
@@ -665,6 +751,8 @@ export const updateMatch = async (req, res, next) => {
     // --------------------------
     const nowFulltime = !!match.fulltime;
     const justMarkedFulltime = (updateData.fulltime === true && !wasFulltime) || (!wasFulltime && nowFulltime);
+    const fantasyDataChanged = ["goals", "cards", "substitutions", "lineups", "manOftheMatch", "homeScore", "awayScore"].some((key) => Object.prototype.hasOwnProperty.call(updateData, key));
+    const shouldRecomputeFantasy = nowFulltime && (justMarkedFulltime || fantasyDataChanged);
 
     if (justMarkedFulltime) {
       // ensure match.fulltime true already (scalar step may have set it)
@@ -678,7 +766,10 @@ export const updateMatch = async (req, res, next) => {
       const homeTeam = match.homeTeam ? await Team.findById(match.homeTeam).session(session) : null;
       const awayTeam = match.awayTeam ? await Team.findById(match.awayTeam).session(session) : null;
 
-      if (homeTeam && awayTeam) {
+      const matchBelongsToCurrentSeason = !fixtureDoc?.competitionId
+        || !homeTeam?.competitionId
+        || String(fixtureDoc.competitionId) === String(homeTeam.competitionId);
+      if (homeTeam && awayTeam && matchBelongsToCurrentSeason) {
         // Count goals using idEquals
         const homeGoals = (match.goals || []).filter((g) => g.team && idEquals(g.team, homeTeam._id)).length;
         const awayGoals = (match.goals || []).filter((g) => g.team && idEquals(g.team, awayTeam._id)).length;
@@ -757,14 +848,17 @@ export const updateMatch = async (req, res, next) => {
     await session.commitTransaction();
     session.endSession();
 
-    // compute fantasy points outside session if justMarkedFulltime
-    if (justMarkedFulltime) {
+    // Recalculate also when an official corrects match events after full time.
+    if (shouldRecomputeFantasy) {
       try {
         await computePointsForMatch(match._id);
       } catch (err) {
         console.error("Error computing fantasy points for match:", err);
       }
     }
+
+    const liveType = updateData.goals ? "goal" : updateData.cards ? "card" : updateData.substitutions ? "substitution" : updateData.fulltime === true ? "fulltime" : "update";
+    publishMatchUpdate(match._id, { matchId: String(match._id), type: liveType, updatedAt: new Date().toISOString() });
 
     // return populated match (include lineups, bench, manOftheMatch)
     const populated = await Match.findById(match._id)
@@ -814,9 +908,14 @@ export const getMatchesByTeam = async (req, res, next) => {
     if (!teamId) return next(createError(400, "teamId required"));
 
     // find matches where the team is home or away
-    const matches = await Match.find({
+    const matchFilter = {
       $or: [{ homeTeam: teamId }, { awayTeam: teamId }],
-    })
+    };
+    if (req.query.competitionId) {
+      const seasonMatchIds = await Fixture.find({ competitionId: req.query.competitionId }).distinct("match");
+      matchFilter._id = { $in: seasonMatchIds };
+    }
+    const matches = await Match.find(matchFilter)
       .populate({ path: "homeTeam", model: "Team", select: "name logo" })
       .populate({ path: "awayTeam", model: "Team", select: "name logo" })
       .populate({ path: "goals.scorer", model: "Player", select: "name" })
@@ -872,7 +971,7 @@ export const getMatchesByTeam = async (req, res, next) => {
 
   export const getGameweeksWithMatches = async (req, res, next) => {
   try {
-    const gameweeks = await Gameweek.find().sort({ number: 1 }).lean();
+    const gameweeks = await Gameweek.find(req.query.competitionId ? { competitionId: req.query.competitionId } : {}).sort({ number: 1 }).lean();
 
     const resultData = await Promise.all(
       gameweeks.map(async (gameweek) => {
@@ -977,13 +1076,13 @@ export const getSingleMatchById = async (req, res, next) => {
     const match = await Match.findById(id)
       .populate({ path: "homeTeam", model: "Team", select: "name logo" })
       .populate({ path: "awayTeam", model: "Team", select: "name logo" })
-      .populate({ path: "lineups.home", model: "Player", select: "_id name number position" })
-      .populate({ path: "lineups.away", model: "Player", select: "_id name number position" })
-      .populate({ path: "bench.home", model: "Player", select: "_id name number position" })
-      .populate({ path: "bench.away", model: "Player", select: "_id name number position" })
-      .populate({ path: "goals.scorer", model: "Player", select: "_id name number" })
-      .populate({ path: "goals.assist", model: "Player", select: "_id name number" })
-      .populate({ path: "goals.ownBy", model: "Player", select: "_id name number" })
+      .populate({ path: "lineups.home", model: "Player", select: "_id name number position playerPic" })
+      .populate({ path: "lineups.away", model: "Player", select: "_id name number position playerPic" })
+      .populate({ path: "bench.home", model: "Player", select: "_id name number position playerPic" })
+      .populate({ path: "bench.away", model: "Player", select: "_id name number position playerPic" })
+      .populate({ path: "goals.scorer", model: "Player", select: "_id name number playerPic" })
+      .populate({ path: "goals.assist", model: "Player", select: "_id name number playerPic" })
+      .populate({ path: "goals.ownBy", model: "Player", select: "_id name number playerPic" })
       .populate({ path: "cards.player", model: "Player", select: "_id name number" })
       .populate({ path: "substitutions.playerIn", model: "Player", select: "_id name number" })
       .populate({ path: "substitutions.playerOut", model: "Player", select: "_id name number" })
@@ -1009,9 +1108,9 @@ export const getSingleMatchById = async (req, res, next) => {
         team: g.team ? (typeof g.team === "object" && g.team._id ? { _id: String(g.team._id), name: g.team.name } : String(g.team)) : null,
         ownGoal: !!g.ownGoal,
         // scorer is null for own goals (but may be populated if provided)
-        scorer: g.scorer ? { _id: String(g.scorer._id ?? g.scorer), name: g.scorer.name ?? null, number: g.scorer.number ?? null } : null,
-        assist: g.assist ? { _id: String(g.assist._id ?? g.assist), name: g.assist.name ?? null, number: g.assist.number ?? null } : null,
-        ownBy: g.ownBy ? { _id: String(g.ownBy._id ?? g.ownBy), name: g.ownBy.name ?? null, number: g.ownBy.number ?? null } : null,
+        scorer: g.scorer ? { _id: String(g.scorer._id ?? g.scorer), name: g.scorer.name ?? null, number: g.scorer.number ?? null, playerPic: g.scorer.playerPic ?? null } : null,
+        assist: g.assist ? { _id: String(g.assist._id ?? g.assist), name: g.assist.name ?? null, number: g.assist.number ?? null, playerPic: g.assist.playerPic ?? null } : null,
+        ownBy: g.ownBy ? { _id: String(g.ownBy._id ?? g.ownBy), name: g.ownBy.name ?? null, number: g.ownBy.number ?? null, playerPic: g.ownBy.playerPic ?? null } : null,
       };
     });
 
@@ -1035,16 +1134,16 @@ export const getSingleMatchById = async (req, res, next) => {
 
     // Lineups & bench - return arrays of players (if populated they are objects)
     const lineupHome = Array.isArray(match.lineups?.home)
-      ? match.lineups.home.map((p) => (p ? { _id: String(p._id ?? p), name: p.name ?? null, number: p.number ?? null } : null)).filter(Boolean)
+      ? match.lineups.home.map((p) => (p ? { _id: String(p._id ?? p), name: p.name ?? null, number: p.number ?? null, position: p.position ?? null, playerPic: p.playerPic ?? null } : null)).filter(Boolean)
       : [];
     const lineupAway = Array.isArray(match.lineups?.away)
-      ? match.lineups.away.map((p) => (p ? { _id: String(p._id ?? p), name: p.name ?? null, number: p.number ?? null } : null)).filter(Boolean)
+      ? match.lineups.away.map((p) => (p ? { _id: String(p._id ?? p), name: p.name ?? null, number: p.number ?? null, position: p.position ?? null, playerPic: p.playerPic ?? null } : null)).filter(Boolean)
       : [];
     const benchHomeArr = Array.isArray(match.bench?.home)
-      ? match.bench.home.map((p) => (p ? { _id: String(p._id ?? p), name: p.name ?? null, number: p.number ?? null } : null)).filter(Boolean)
+      ? match.bench.home.map((p) => (p ? { _id: String(p._id ?? p), name: p.name ?? null, number: p.number ?? null, position: p.position ?? null, playerPic: p.playerPic ?? null } : null)).filter(Boolean)
       : [];
     const benchAwayArr = Array.isArray(match.bench?.away)
-      ? match.bench.away.map((p) => (p ? { _id: String(p._id ?? p), name: p.name ?? null, number: p.number ?? null } : null)).filter(Boolean)
+      ? match.bench.away.map((p) => (p ? { _id: String(p._id ?? p), name: p.name ?? null, number: p.number ?? null, position: p.position ?? null, playerPic: p.playerPic ?? null } : null)).filter(Boolean)
       : [];
 
     // Man of the match (may be populated or id)
@@ -1053,6 +1152,38 @@ export const getSingleMatchById = async (req, res, next) => {
         ? { _id: String(match.manOftheMatch._id), name: match.manOftheMatch.name ?? null, number: match.manOftheMatch.number ?? null }
         : { _id: String(match.manOftheMatch) })
       : null;
+
+    // Form estimate from completed results in this competition, including matches
+    // where the same club appeared as either home or away.
+    const fixture = await Fixture.findOne({ match: match._id }).populate("gameweek", "competitionId").lean().exec();
+    const competitionId = fixture?.competitionId || fixture?.gameweek?.competitionId;
+    const fixtureRows = competitionId
+      ? await Fixture.find({ competitionId, match: { $ne: match._id } }).select("match").lean().exec()
+      : [];
+    const priorIds = fixtureRows.map((row) => row.match).filter(Boolean);
+    const priorResults = priorIds.length
+      ? await Match.find({ _id: { $in: priorIds }, fulltime: true, ...(match.date ? { date: { $lt: match.date } } : {}) }).select("homeTeam awayTeam homeScore awayScore date").lean().exec()
+      : [];
+    const formFor = (teamId) => {
+      const played = priorResults.filter((result) => String(result.homeTeam) === String(teamId) || String(result.awayTeam) === String(teamId));
+      let points = 0;
+      let goalDifference = 0;
+      for (const result of played) {
+        const atHome = String(result.homeTeam) === String(teamId);
+        const scored = Number(atHome ? result.homeScore : result.awayScore) || 0;
+        const conceded = Number(atHome ? result.awayScore : result.homeScore) || 0;
+        points += scored > conceded ? 3 : scored === conceded ? 1 : 0;
+        goalDifference += scored - conceded;
+      }
+      const count = Math.max(played.length, 1);
+      return { count: played.length, strength: 0.65 * (points / (3 * count)) + 0.35 * (0.5 + Math.tanh(goalDifference / count / 2) / 2) };
+    };
+    const homeForm = formFor(match.homeTeam?._id ?? match.homeTeam);
+    const awayForm = formFor(match.awayTeam?._id ?? match.awayTeam);
+    const formGap = homeForm.strength - awayForm.strength + 0.08;
+    const drawPct = Math.round(Math.max(14, Math.min(34, (0.31 - Math.abs(formGap) * 0.25) * 100)));
+    const homePct = Math.round((100 - drawPct) / (1 + Math.exp(-formGap * 5)));
+    const probability = { home: homePct, draw: drawPct, away: 100 - homePct - drawPct, sampleSize: { home: homeForm.count, away: awayForm.count } };
 
     // Build response object
     const responseData = {
@@ -1066,11 +1197,13 @@ export const getSingleMatchById = async (req, res, next) => {
       result: match.result ?? computedResult,
       homeScore: safeHomeScore,
       awayScore: safeAwayScore,
+      probability,
       // arrays
       goals,
       cards,
       substitutions,
       lineups: { home: lineupHome, away: lineupAway },
+      formations: match.formations || { home: "", away: "" },
       bench: { home: benchHomeArr, away: benchAwayArr },
       manOftheMatch: motm,
       // timeline references if you need them

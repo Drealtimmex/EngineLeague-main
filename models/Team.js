@@ -21,6 +21,9 @@ const teamSchema = new mongoose.Schema({
   overallGoalsFor: { type: Number, default: 0 },
   overallGoalsAgainst: { type: Number, default: 0 },
   overallPoints: { type: Number, default: 0 },
+  // Frozen standings keyed by the completed competition id. The live fields
+  // above continue to serve the current table for existing clients.
+  seasonSnapshots: { type: Map, of: mongoose.Schema.Types.Mixed, default: {} },
   createdAt: { type: Date, default: Date.now }
 });
 

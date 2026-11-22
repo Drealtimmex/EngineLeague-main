@@ -1,5 +1,5 @@
 import express from "express";
-import {createCompetition, getAllCompetitions, getCompetitionById, deleteCompetition} from "../controllers/competition.js";
+import {createCompetition, getAllCompetitions, getCompetitionById, deleteCompetition, getActiveCompetition} from "../controllers/competition.js";
 import { verifyToken } from "../verifyToken.js";
 
 const router = express.Router();
@@ -8,6 +8,7 @@ const router = express.Router();
 router.post("/", verifyToken, createCompetition);
 
 router.get("/", getAllCompetitions);
+router.get("/active", getActiveCompetition);
 router.get("/:id", getCompetitionById);
 router.delete("/:id", deleteCompetition);
 

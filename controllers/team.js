@@ -154,7 +154,10 @@ console.log (`this is ${competitionId}`)
       return next(createError(400, "Competition ID is required"));
     }
 
-    const teams = await Team.find({ competitionId: competitionId }) // Assuming "competition" is a field in Team model
+    const competition = await Competition.findById(competitionId).lean();
+    if (!competition) return next(createError(404, "Competition not found"));
+    const ids = competition.teams?.length ? competition.teams : (await Team.find({ competitionId }).distinct("_id"));
+    const teams = await Team.find({ _id: { $in: ids } })
       .populate("coach", "name")
       .populate("players", "name position");
 
@@ -162,9 +165,17 @@ console.log (`this is ${competitionId}`)
       return next(createError(404, "No teams found for this competition"));
     }
 
+    const data = teams.map((team) => {
+      const doc = team.toObject();
+      const snapshot = team.seasonSnapshots?.get?.(String(competitionId)) || team.seasonSnapshots?.[String(competitionId)];
+      if (snapshot) {
+        for (const field of ["matchesPlayed", "wins", "draws", "losses", "goalsFor", "goalsAgainst", "points"]) doc[field] = snapshot[field] ?? 0;
+      }
+      return doc;
+    });
     res.status(200).json({
       success: true,
-      data: teams,
+      data,
     });
   } catch (error) {
     console.error("Error fetching teams:", error);

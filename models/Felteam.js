@@ -16,7 +16,9 @@ const lineupSnapshotSchema = new mongoose.Schema(
   {
     squad: [{ type: mongoose.Schema.Types.ObjectId, ref: "Player" }], // 15 ids for this gameweek
     starting: [{ type: mongoose.Schema.Types.ObjectId, ref: "Player" }], // 11 ids
+    resolvedStarting: [{ type: mongoose.Schema.Types.ObjectId, ref: "Player" }],
     captain: { type: mongoose.Schema.Types.ObjectId, ref: "Player", default: null },
+    resolvedCaptain: { type: mongoose.Schema.Types.ObjectId, ref: "Player", default: null },
     viceCaptain: { type: mongoose.Schema.Types.ObjectId, ref: "Player", default: null },
     setAt: { type: Date, default: Date.now },
     // optional: whether this snapshot is intended to be the durable default lineup

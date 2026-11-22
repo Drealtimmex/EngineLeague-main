@@ -15,6 +15,8 @@ import coachesRoutes from "./routes/coaches.js"
 import fantasyRoutes from "./routes/fantasy.js"
 import timelineRoutes from "./routes/timeline.js"
 import analyticsRoutes from "./routes/analytics.js"
+import sponsorRoutes from "./routes/sponsors.js"
+import contentRoutes from "./routes/content.js"
 import "./controllers/cronjob/cron.js"
 import "./controllers/gameweek.js"
 import bodyParser from "body-parser";
@@ -53,6 +55,8 @@ app.use("/api/team",teamRoutes)
 app.use("/api/fantasy",fantasyRoutes)
 app.use("/api/timeline",timelineRoutes)
 app.use("/api/analytics",analyticsRoutes)
+app.use("/api/sponsors", sponsorRoutes)
+app.use("/api/content", contentRoutes)
 // Use email routes
 // app.use('/api', emailRoutes);
 

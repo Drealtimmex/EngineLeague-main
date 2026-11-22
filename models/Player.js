@@ -5,6 +5,7 @@ const fantasyStatSchema = new mongoose.Schema(
   {
     match: { type: mongoose.Schema.Types.ObjectId, ref: "Match", required: true },
     gameweek: { type: Number, default: null }, // nullable if gameweek unknown
+    competitionId: { type: mongoose.Schema.Types.ObjectId, ref: "Competition", default: null },
     points: { type: Number, required: true },
     createdAt: { type: Date, default: Date.now },
   },
@@ -43,6 +44,8 @@ const playerSchema = new mongoose.Schema({
   // NEW: fantasy-related fields
   fantasyStats: { type: [fantasyStatSchema], default: [] }, // per-match/gameweek points for the player
   totalFantasyPoints: { type: Number, default: 0 }, // running total across season
+  competitionFantasyPoints: { type: Map, of: Number, default: {} },
+  seasonSnapshots: { type: Map, of: mongoose.Schema.Types.Mixed, default: {} },
 
   matchBan: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now }

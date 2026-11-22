@@ -64,6 +64,10 @@ const MatchSchema = new Schema(
       home: [{ type: Schema.Types.ObjectId, ref: "Player" }],
       away: [{ type: Schema.Types.ObjectId, ref: "Player" }],
     },
+    formations: {
+      home: { type: String, default: "" },
+      away: { type: String, default: "" },
+    },
     bench: {
       home: [{ type: Schema.Types.ObjectId, ref: "Player" }],
       away: [{ type: Schema.Types.ObjectId, ref: "Player" }],

@@ -9,6 +9,7 @@ import Match from "../models/Match.js";
 import Fixture from "../models/Fixtures.js";
 import Gameweek from "../models/Gameweek.js";
 import FantasyTeam from "../models/Felteam.js";
+import Competition from "../models/Competition.js";
 const { Types } = mongoose;
 /**
  * NOTE / Model expectations:
@@ -34,7 +35,7 @@ const FWD_MIN = 2;
 const FWD_MAX = 3;
 const MAX_FROM_SAME_TEAM = 7;
 const MAX_FREE_TRANSFERS_PER_GW = 3;
-const TRANSFER_LIMITS_ENABLED = false;
+const TRANSFER_LIMITS_ENABLED = true;
 const POWERUP_KEYS = ["wildcard", "benchBoost", "tripleCaptain"];
 const POWERUP_ALIASES = {
   wildcard: "wildcard",
@@ -195,14 +196,15 @@ function getFantasyTeamGwSnapshot(teamDoc, gameweekNumber) {
   const squad = Array.isArray(snapshot.squad) && snapshot.squad.length
     ? snapshot.squad.map(String)
     : currentSquad;
-  const starting = Array.isArray(snapshot.starting) && snapshot.starting.length
-    ? snapshot.starting.map(String)
+  const effectiveStarting = snapshot.resolvedStarting?.length ? snapshot.resolvedStarting : snapshot.starting;
+  const starting = Array.isArray(effectiveStarting) && effectiveStarting.length
+    ? effectiveStarting.map(String)
     : currentStarting;
 
   return {
     squad,
     starting,
-    captain: snapshot.captain ? String(snapshot.captain) : (teamDoc.captain ? String(teamDoc.captain) : null),
+    captain: snapshot.resolvedCaptain ? String(snapshot.resolvedCaptain) : (snapshot.captain ? String(snapshot.captain) : (teamDoc.captain ? String(teamDoc.captain) : null)),
     viceCaptain: snapshot.viceCaptain ? String(snapshot.viceCaptain) : (teamDoc.viceCaptain ? String(teamDoc.viceCaptain) : null),
   };
 }
@@ -236,13 +238,17 @@ function assertPowerupSelectionAllowed(teamDoc, selectedPowerups, gameweekNumber
  * If created after every GW.deadline (or GW.deadline null), it will take effect in the next GW
  * (or null if none exist).
  */
-async function findEffectiveGameweekForTime(time = new Date()) {
+async function findEffectiveGameweekForTime(competitionId, time = new Date()) {
+  const scope = competitionId ? { competitionId } : {};
   // Find the earliest gameweek whose deadline is after 'time'
   // If a GW has null deadline, ignore it for effect calculation.
-  const gw = await Gameweek.findOne({ deadline: { $ne: null, $gt: time } }).sort({ number: 1 }).exec();
+  const gw = await Gameweek.findOne({
+    ...scope,
+    $or: [{ deadline: null }, { deadline: { $gt: time } }],
+  }).sort({ number: 1 }).exec();
   if (gw) return gw.number;
   // If none found, try max number + 1 (future GW placeholder)
-  const last = await Gameweek.findOne({}).sort({ number: -1 }).lean().exec();
+  const last = await Gameweek.findOne(scope).sort({ number: -1 }).lean().exec();
   if (last) return last.number + 1;
   return null;
 }
@@ -251,9 +257,9 @@ async function findEffectiveGameweekForTime(time = new Date()) {
  * Get active gameweek for "now" - the GW whose deadline is next (deadline > now) or current running GW.
  * This is used for transfers/lineups validation.
  */
-async function getUpcomingGameweek() {
+async function getUpcomingGameweek(competitionId) {
   const now = new Date();
-  return await Gameweek.findOne({ deadline: { $ne: null, $gt: now } }).sort({ number: 1 }).exec();
+  return await Gameweek.findOne({ ...(competitionId ? { competitionId } : {}), deadline: { $ne: null, $gt: now } }).sort({ number: 1 }).exec();
 }
 
 /**
@@ -336,18 +342,19 @@ async function validateAndEnrichSquad(playersInput = [], budget = 150, options =
 export const createFantasyTeam = async (req, res, next) => {
   try {
     const userId = req.user.id;
-    const { teamName, players, teamLogo, budget = 150, competitionId } = req.body;
+    let { teamName, players, teamLogo, budget = 150, competitionId } = req.body;
     if (!teamName) return next(createError(400, "teamName required"));
     if (!players || !Array.isArray(players)) return next(createError(400, "players array required"));
-    const checking = await FantasyTeam.findOne({ user:userId})
-    if(checking) return next(createError(400, "teamalready created"))
+    if (!competitionId) competitionId = (await Competition.findOne({ isActive: true }).sort({ createdAt: -1 }).lean())?._id || null;
+    const checking = await FantasyTeam.findOne({ user: userId, competitionId });
+    if (checking) return next(createError(409, "You already have a fantasy team for this competition"));
     // Validate/enrich squad
     const validation = await validateAndEnrichSquad(players, budget);
     if (!validation.valid) return next(createError(400, validation.message));
 
     // Determine effective gameweek
     const createdAt = new Date();
-    const effectiveGameweek = await findEffectiveGameweekForTime(createdAt);
+    const effectiveGameweek = await findEffectiveGameweekForTime(competitionId, createdAt);
 
     const ft = new FantasyTeam({
       user: userId,
@@ -360,8 +367,10 @@ export const createFantasyTeam = async (req, res, next) => {
       createdAt,
       effectiveGameweek,
       transfers: {
-        lastResetGw: effectiveGameweek, // track when transfers were last reset
-        freeTransfersUsedInGw: 0
+        lastResetGw: effectiveGameweek ?? 1,
+        // The initial squad is selected in full during registration. Free
+        // transfers start with the following gameweek.
+        freeTransfersUsedInGw: MAX_FREE_TRANSFERS_PER_GW
       },
       powerups: {
         wildcard: { available: true, usedGameweek: null },
@@ -395,7 +404,7 @@ export const editFantasyTeam = async (req, res, next) => {
     if (team.user.toString() !== userId) return next(createError(403, "Not authorized"));
 
     // transfers/edits deadline: must be before upcoming gameweek deadline OR before the team's effective GW deadline
-    const upcomingGW = await getUpcomingGameweek();
+    const upcomingGW = await getUpcomingGameweek(team.competitionId);
     const now = new Date();
 
     if (upcomingGW && upcomingGW.deadline) {
@@ -460,7 +469,7 @@ export const makeTransfers = async (req, res, next) => {
     if (String(team.user) !== String(userId)) return next(createError(403, "Not authorized"));
 
     // upcoming GW & deadline guard
-    const upcomingGW = await getUpcomingGameweek();
+    const upcomingGW = await getUpcomingGameweek(team.competitionId);
     const now = new Date();
     if (!upcomingGW || !upcomingGW.deadline) {
       return next(createError(400, "No active gameweek found for transfers"));
@@ -752,13 +761,13 @@ export const setLineup = async (req, res, next) => {
       }
     } else {
       // pick upcoming gameweek by default
-      const upcoming = await getUpcomingGameweek();
+      const upcoming = await getUpcomingGameweek(team.competitionId);
       if (!upcoming || !upcoming.number) return next(createError(400, "No active gameweek"));
       targetGw = upcoming.number;
     }
 
     // if target is upcoming GW, check deadline guard
-    const upcomingGW = await getUpcomingGameweek();
+      const upcomingGW = await getUpcomingGameweek(team.competitionId);
     if (targetGw && upcomingGW && targetGw === upcomingGW.number) {
       if (!upcomingGW.deadline) return next(createError(400, "No active gameweek deadline"));
       const now = new Date();
@@ -885,7 +894,8 @@ export const getFantasyTeamById = async (req, res, next) => {
 export const getFantasyTeamByLoggedId = async (req, res, next) => {
   try {
     const user = req.user.id
-    const team = await FantasyTeam.findOne( {user:user}).populate("user", "username email").populate("players.player", "name position team price").exec();
+    const competitionId = req.query.competitionId || (await Competition.findOne({ isActive: true }).sort({ createdAt: -1 }).lean())?._id;
+    const team = await FantasyTeam.findOne({ user, ...(competitionId ? { competitionId } : {}) }).populate("user", "username email").populate("players.player", "name position team price").exec();
     if (!team) return next(createError(404, "Fantasy team not found"));
     ensurePowerupsShape(team);
     return res.status(200).json({ success: true, data: team });
@@ -944,6 +954,10 @@ export const getFantasyTeamByLoggedId = async (req, res, next) => {
  * Returns integer points (rounded)
  */
 export function calculatePlayerMatchPoints(perf = {}, posCategory = "MID", concededGoals = 0, started = false, subOn = false, teamOutcome = null) {
+  // A player with no recorded start or substitute appearance must score zero,
+  // even if an inconsistent match event references them.
+  if (!started && !subOn) return 0;
+
   let pts = 0;
 
   // Appearance bonus: starter 2, sub-on 1
@@ -969,8 +983,8 @@ export function calculatePlayerMatchPoints(perf = {}, posCategory = "MID", conce
   if (perf.redCard) pts -= 3;
 
   // Clean sheet
-  if (started && (posCategory === "GK" || posCategory === "DEF") && Number(concededGoals || 0) === 0) pts += 4;
-  if (started && posCategory === "MID" && Number(concededGoals || 0) === 0) pts += 1;
+  if ((started || subOn) && (posCategory === "GK" || posCategory === "DEF") && Number(concededGoals || 0) === 0) pts += 4;
+  if ((started || subOn) && posCategory === "MID" && Number(concededGoals || 0) === 0) pts += 1;
 
   // Team outcome bonus (apply only if player played)
   if ((started || subOn) && teamOutcome) {
@@ -980,6 +994,120 @@ export function calculatePlayerMatchPoints(perf = {}, posCategory = "MID", conce
   }
 
   return Math.round(pts);
+}
+
+function positionForPlayer(player) {
+  const pos = String(player?.position || "").toUpperCase();
+  if (pos === "GK") return "GK";
+  return normalizePositionCategory(pos);
+}
+
+async function applyAutomaticBenchSubs(competitionId, gameweekNumber, session) {
+  if (!gameweekNumber) return;
+  const gameweek = await Gameweek.findOne({ competitionId, number: gameweekNumber }).session(session).lean();
+  if (!gameweek) return;
+  const fixtures = await Fixture.find({ _id: { $in: gameweek.fixtures } }).session(session).lean();
+  const matchIds = fixtures.map((f) => f.match).filter(Boolean);
+  if (!matchIds.length) return;
+  const matches = await Match.find({ _id: { $in: matchIds } }).session(session).lean();
+  if (matches.length !== matchIds.length || matches.some((m) => !m.fulltime)) return;
+
+  const played = new Set();
+  for (const match of matches) {
+    for (const id of [...(match.lineups?.home || []), ...(match.lineups?.away || [])]) played.add(String(id));
+    for (const sub of match.substitutions || []) if (sub.playerIn) played.add(String(sub.playerIn));
+  }
+  const stats = await Player.find({ "fantasyStats.match": { $in: matchIds } }).session(session).select("position fantasyStats").lean();
+  const playerById = new Map(stats.map((p) => [String(p._id), p]));
+  const pointsByMatch = new Map();
+  for (const p of stats) for (const stat of p.fantasyStats || []) {
+    if (!matchIds.some((id) => String(id) === String(stat.match))) continue;
+    if (stat.competitionId && String(stat.competitionId) !== String(competitionId)) continue;
+    if (stat.gameweek != null && Number(stat.gameweek) !== Number(gameweekNumber)) continue;
+    const matchKey = String(stat.match);
+    if (!pointsByMatch.has(matchKey)) pointsByMatch.set(matchKey, new Map());
+    pointsByMatch.get(matchKey).set(String(p._id), Number(stat.points || 0));
+  }
+
+  const fantasyTeams = await FantasyTeam.find({ competitionId }).session(session).exec();
+  const allSquadIds = fantasyTeams.flatMap((team) => getFantasyTeamGwSnapshot(team, gameweekNumber).squad.map(String));
+  const allPlayerDocs = await Player.find({ _id: { $in: allSquadIds } }).session(session).select("position").lean();
+  for (const player of allPlayerDocs) if (!playerById.has(String(player._id))) playerById.set(String(player._id), player);
+  for (const team of fantasyTeams) {
+    if (team.effectiveGameweek && team.effectiveGameweek > gameweekNumber) continue;
+    const rawStoredSnapshot = getMapValue(team.lineupSnapshots, String(gameweekNumber)) || getMapValue(team.lineupSnapshots, "default") || {};
+    const storedSnapshot = rawStoredSnapshot?.toObject ? rawStoredSnapshot.toObject() : rawStoredSnapshot;
+    const snapshot = getFantasyTeamGwSnapshot(team, gameweekNumber);
+    if (snapshot.starting.length !== 11 || snapshot.squad.length !== 15) continue;
+    const squad = snapshot.squad.map(String);
+    const starters = (storedSnapshot.starting?.length ? storedSnapshot.starting : snapshot.starting).map(String);
+    const bench = squad.filter((id) => !starters.includes(id));
+    const position = (id) => positionForPlayer(playerById.get(id));
+    const counts = { GK: 0, DEF: 0, MID: 0, FWD: 0 };
+    for (const id of starters) counts[position(id)]++;
+    const replacements = new Map();
+
+    for (const outId of starters) {
+      if (played.has(outId) || replacements.size >= 4) continue;
+      const outCategory = position(outId);
+      const candidates = bench.filter((id) => played.has(id) && ![...replacements.values()].includes(id));
+      candidates.sort((a, b) => Number(position(b) === outCategory) - Number(position(a) === outCategory));
+      const replacement = candidates.find((inId) => {
+        const inCategory = position(inId);
+        if (outCategory === "GK" || inCategory === "GK") return outCategory === "GK" && inCategory === "GK";
+        const next = { ...counts };
+        next[outCategory]--;
+        next[inCategory]++;
+        return next.DEF >= 3 && next.DEF <= 5 && next.MID >= 3 && next.MID <= 5 && next.FWD >= 1 && next.FWD <= 3;
+      });
+      if (!replacement) continue;
+      counts[outCategory]--;
+      counts[position(replacement)]++;
+      replacements.set(outId, replacement);
+    }
+
+    const resolvedStarting = starters.map((id) => replacements.get(id) || id);
+    const startingSet = new Set(resolvedStarting);
+    const activeSquad = isPowerupActiveForGw(team, "benchBoost", gameweekNumber) ? new Set(squad) : startingSet;
+    const originalCaptain = storedSnapshot.captain ? String(storedSnapshot.captain) : snapshot.captain;
+    const captainPlayed = originalCaptain && played.has(originalCaptain);
+    const effectiveCaptain = captainPlayed ? originalCaptain : (snapshot.viceCaptain && played.has(snapshot.viceCaptain) ? snapshot.viceCaptain : originalCaptain);
+    const triple = isPowerupActiveForGw(team, "tripleCaptain", gameweekNumber);
+    const matchPoints = typeof team.matchPoints?.entries === "function" ? Object.fromEntries(team.matchPoints.entries()) : { ...(team.matchPoints || {}) };
+
+    for (const match of matches) {
+      const contributions = [];
+      let total = 0;
+      const playerPoints = pointsByMatch.get(String(match._id)) || new Map();
+      for (const [playerId, points] of playerPoints) {
+        if (!activeSquad.has(playerId)) continue;
+        const isCaptain = String(effectiveCaptain || "") === playerId;
+        const countedPoints = points * (isCaptain ? (triple ? 3 : 2) : 1);
+        total += countedPoints;
+        contributions.push({ playerId, points, countedPoints, isStarting: startingSet.has(playerId), isCaptain, isVice: String(snapshot.viceCaptain || "") === playerId });
+      }
+      matchPoints[String(match._id)] = { points: total, gameweek: gameweekNumber, contributors: contributions };
+      await Match.updateOne(
+        { _id: match._id },
+        { $set: { [`fantasyTeamPoints.${String(team._id)}`]: total } },
+      ).session(session).exec();
+    }
+
+    team.matchPoints = matchPoints;
+    const gwTotal = Object.values(matchPoints).filter((v) => Number(v?.gameweek) === Number(gameweekNumber)).reduce((sum, v) => sum + Number(v?.points || 0), 0);
+    if (typeof team.gameweekPoints?.set === "function") team.gameweekPoints.set(String(gameweekNumber), gwTotal);
+    else team.gameweekPoints = { ...(team.gameweekPoints || {}), [String(gameweekNumber)]: gwTotal };
+    team.points = Object.values(matchPoints).reduce((sum, v) => sum + Number(v?.points || 0), 0);
+    team.lineupSnapshots = setMapValue(team.lineupSnapshots, gameweekNumber, {
+      ...storedSnapshot, squad, resolvedStarting,
+      resolvedCaptain: effectiveCaptain ? String(effectiveCaptain) : null,
+      setAt: new Date(), isDefault: false,
+    });
+    team.markModified("matchPoints");
+    team.markModified("gameweekPoints");
+    team.markModified("lineupSnapshots");
+    await team.save({ session });
+  }
 }
 
 /**
@@ -1074,10 +1202,18 @@ export async function computePointsForMatch(matchId) {
       }
     });
 
+    // Include players scored previously for this match so removed/corrected
+    // events are recalculated back to zero rather than left in season totals.
+    const previouslyScored = await Player.find({ "fantasyStats.match": match._id }).session(session).select("_id").lean().exec();
+    for (const player of previouslyScored) {
+      const id = String(player._id);
+      perfByPlayer[id] = perfByPlayer[id] || { goals: 0, assists: 0, yellowCards: 0, redCard: false, manOfTheMatch: false, started: false, subOn: false };
+    }
     const playerIds = Object.keys(perfByPlayer);
     // Determine gameweekNumber
     let gameweekNumber = null;
     const fixture = await Fixture.findOne({ match: match._id }).populate("gameweek").lean().exec();
+    const fixtureCompetitionId = fixture?.competitionId ? String(fixture.competitionId) : null;
     if (fixture) {
       if (fixture.gameweek && typeof fixture.gameweek === "object" && fixture.gameweek.number != null) {
         gameweekNumber = Number(fixture.gameweek.number);
@@ -1101,8 +1237,9 @@ export async function computePointsForMatch(matchId) {
     // if no players in perf map: update match.gameweek if known and return early
     if (playerIds.length === 0) {
       if (gameweekNumber != null) {
-        await Match.updateOne({ _id: match._id }, { $set: { gameweek: gameweekNumber } }).session(session).exec();
+        await Match.updateOne({ _id: match._id }, { $set: { gameweek: gameweekNumber, fantasyProcessed: true } }).session(session).exec();
       }
+      await applyAutomaticBenchSubs(fixtureCompetitionId, gameweekNumber, session);
       await session.commitTransaction();
       session.endSession();
       return { success: true, players: 0, gameweekNumber };
@@ -1155,19 +1292,32 @@ export async function computePointsForMatch(matchId) {
       playerPoints[pid] = pts;
     }
 
-    // Bulk update Player.fantasyStats and totalFantasyPoints
+    // Replace this match's prior player score when an official corrects a
+    // completed match. Keeping the update idempotent prevents duplicate stats
+    // and adjusts season totals by only the score difference.
     const playerBulkOps = [];
     for (const [pid, pts] of Object.entries(playerPoints)) {
-      // push only if not already pushed for this match (idempotent check)
-      playerBulkOps.push({
-        updateOne: {
-          filter: { _id: new mongoose.Types.ObjectId(pid), "fantasyStats.match": { $ne: new mongoose.Types.ObjectId(match._id) } },
-          update: {
-            $push: { fantasyStats: { match: match._id, gameweek: gameweekNumber, points: pts } },
-            $inc: { totalFantasyPoints: pts },
-          },
+      const player = playerMap[pid];
+      const previous = (player?.fantasyStats || []).find((stat) => String(stat.match?._id || stat.match) === String(match._id));
+      const delta = Number(pts) - Number(previous?.points || 0);
+      const update = previous ? {
+        $set: {
+          "fantasyStats.$.points": Number(pts),
+          "fantasyStats.$.gameweek": gameweekNumber,
+          "fantasyStats.$.competitionId": fixtureCompetitionId,
         },
-      });
+        $inc: {
+          totalFantasyPoints: delta,
+          ...(fixtureCompetitionId ? { [`competitionFantasyPoints.${fixtureCompetitionId}`]: delta } : {}),
+        },
+      } : {
+        $push: { fantasyStats: { match: match._id, gameweek: gameweekNumber, competitionId: fixtureCompetitionId, points: Number(pts) } },
+        $inc: {
+          totalFantasyPoints: Number(pts),
+          ...(fixtureCompetitionId ? { [`competitionFantasyPoints.${fixtureCompetitionId}`]: Number(pts) } : {}),
+        },
+      };
+      playerBulkOps.push({ updateOne: { filter: { _id: new mongoose.Types.ObjectId(pid), ...(previous ? { "fantasyStats.match": match._id } : { "fantasyStats.match": { $ne: match._id } }) }, update } });
     }
     if (playerBulkOps.length > 0) {
       await Player.bulkWrite(playerBulkOps, { session });
@@ -1175,7 +1325,7 @@ export async function computePointsForMatch(matchId) {
 
     // Load teams broadly because historical gameweek snapshots may include players
     // who are no longer in the team's current roster after later transfers.
-    const fTeams = await FantasyTeam.find({}).session(session).exec();
+    const fTeams = await FantasyTeam.find(fixtureCompetitionId ? { competitionId: fixtureCompetitionId } : { competitionId: null }).session(session).exec();
     const matchFantasyTeamPoints = {};
 
     for (const ft of fTeams) {
@@ -1212,8 +1362,6 @@ export async function computePointsForMatch(matchId) {
           tripleCaptainActive,
         });
       }
-
-      if (contributors.length === 0) continue;
 
       // Save matchPoints entry keyed by match._id
       const matchKey = String(match._id);
@@ -1304,6 +1452,8 @@ export async function computePointsForMatch(matchId) {
     if (Object.keys(matchFantasyTeamPoints).length > 0) matchUpdate.fantasyTeamPoints = matchFantasyTeamPoints;
     await Match.updateOne({ _id: match._id }, { $set: matchUpdate }).session(session).exec();
 
+    await applyAutomaticBenchSubs(fixtureCompetitionId, gameweekNumber, session);
+
     await session.commitTransaction();
     session.endSession();
 
@@ -1325,22 +1475,15 @@ export async function computePointsForMatch(matchId) {
 
 
   export const deleteTeam = async (req, res, next) => {
-    const user = req.user.id
-   
-    
-    if (user || user.role === "admin"){
-      try{
-        await FantasyTeam.findOneAndDelete({user:user})
-        res.status(200).json("user has been deleted")
-  
-      }catch (err){
-        next(err)
-      }
+    try {
+      const userId = req.user.id;
+      const competitionId = req.query.competitionId || (await Competition.findOne({ isActive: true }).sort({ createdAt: -1 }).lean())?._id;
+      const deleted = await FantasyTeam.findOneAndDelete({ user: userId, ...(competitionId ? { competitionId } : {}) });
+      if (!deleted) return next(createError(404, "Fantasy team not found for this competition"));
+      return res.status(200).json({ success: true, message: "Fantasy team deleted" });
+    } catch (err) {
+      return next(err);
     }
-  
-  else {
-    return next(createError(403, "You are not authorized!"))
-  }
   }
 /* -----------------------
    Hook into match update flow
@@ -1463,7 +1606,7 @@ export const substitutePlayers = async (req, res) => {
     const snapshot = buildLineupSnapshot(team, startingIds, team.captain, team.viceCaptain, true);
     if (!team.lineupSnapshots) team.lineupSnapshots = new Map();
     team.lineupSnapshots = setMapValue(team.lineupSnapshots, "default", snapshot);
-    const upcomingGW = await getUpcomingGameweek();
+    const upcomingGW = await getUpcomingGameweek(team.competitionId);
     if (upcomingGW?.number) {
       saveSnapshotForGw(team, upcomingGW.number, { ...snapshot, isDefault: false });
     }
@@ -1500,7 +1643,7 @@ export const setCaptainVice = async (req, res, next) => {
     if (!userId || String(team.user) !== String(userId)) {
       return res.status(403).json({ message: "Forbidden: not team owner" });
     }
-    const upcomingGW = await getUpcomingGameweek();
+    const upcomingGW = await getUpcomingGameweek(team.competitionId);
     if (!upcomingGW || !upcomingGW.number) return next(createError(400, "No active gameweek"));
     targetGw = upcomingGW.number;
     

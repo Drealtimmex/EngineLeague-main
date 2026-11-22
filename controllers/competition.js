@@ -1,4 +1,6 @@
 import Competition from "../models/Competition.js"
+import Team from "../models/Team.js"
+import Player from "../models/Player.js"
 import User from "../models/User.js"
 import { createError } from "../error.js";
 
@@ -12,10 +14,55 @@ export const createCompetition = async (req, res, next) => {
       return next(createError(403, "Only admins can create teams"));
     }
 
-    const { name,logo } = req.body;
+    const { name, logo, season } = req.body;
 
     // Create a new team
-    const newCompetition = await Competition.create({ name, logo});
+    // Creating a new season makes it current; prior competition documents and
+    // all of their matches/statistics remain intact.
+    const previous = await Competition.findOne({ isActive: true }).sort({ createdAt: -1 })
+      || await Competition.findOne().sort({ createdAt: -1 });
+    const previousTeams = previous ? await Team.find({ competitionId: previous._id }) : [];
+    const newCompetition = await Competition.create({
+      name, logo, season: season || name, isActive: true,
+      teams: previousTeams.map((team) => team._id),
+    });
+    for (const team of previousTeams) {
+      const oldId = String(previous._id);
+      const snapshots = team.seasonSnapshots || new Map();
+      const value = {
+        competitionId: previous._id,
+        matchesPlayed: team.matchesPlayed, wins: team.wins, draws: team.draws,
+        losses: team.losses, goalsFor: team.goalsFor, goalsAgainst: team.goalsAgainst,
+        points: team.points,
+      };
+      if (typeof snapshots.set === "function") snapshots.set(oldId, value);
+      else snapshots[oldId] = value;
+      team.seasonSnapshots = snapshots;
+      team.competitionId = newCompetition._id;
+      team.matchesPlayed = team.wins = team.draws = team.losses = 0;
+      team.goalsFor = team.goalsAgainst = team.points = 0;
+      team.markModified("seasonSnapshots");
+      await team.save();
+    }
+    if (previous) {
+      const players = await Player.find({});
+      for (const player of players) {
+        const oldId = String(previous._id);
+        const snapshots = player.seasonSnapshots || new Map();
+        const value = {
+          competitionId: previous._id,
+          goals: player.goals, assists: player.assists,
+          yellowCards: player.totalyellowCards, redCards: player.totalredCards,
+        };
+        if (typeof snapshots.set === "function") snapshots.set(oldId, value);
+        else snapshots[oldId] = value;
+        player.seasonSnapshots = snapshots;
+        player.goals = player.assists = player.totalyellowCards = player.totalredCards = 0;
+        player.markModified("seasonSnapshots");
+        await player.save();
+      }
+    }
+    if (previous) await Competition.updateOne({ _id: previous._id }, { $set: { isActive: false } });
 
     res.status(201).json({
       success: true,
@@ -24,6 +71,15 @@ export const createCompetition = async (req, res, next) => {
   } catch (error) {
     console.error("Error creating team:", error);
     next(createError(500, "Failed to create team"));
+  }
+};
+
+export const getActiveCompetition = async (_req, res, next) => {
+  try {
+    const competition = await Competition.findOne({ isActive: true }).sort({ createdAt: -1 });
+    return res.status(200).json({ success: true, data: competition });
+  } catch (error) {
+    return next(createError(500, "Failed to fetch active competition"));
   }
 };
 
