@@ -140,6 +140,79 @@ function getActivePowerupsForGw(teamDoc, gameweekNumber) {
   return POWERUP_KEYS.filter((key) => isPowerupActiveForGw(teamDoc, key, gameweekNumber));
 }
 
+function toIdString(value) {
+  if (!value) return null;
+  if (typeof value === "object" && value._id) return String(value._id);
+  return String(value);
+}
+
+function getMapValue(mapLike, key) {
+  if (!mapLike) return null;
+  if (typeof mapLike.get === "function") return mapLike.get(String(key)) || null;
+  return mapLike[String(key)] || null;
+}
+
+function setMapValue(mapLike, key, value) {
+  if (mapLike && typeof mapLike.set === "function") {
+    mapLike.set(String(key), value);
+    return mapLike;
+  }
+  return { ...(mapLike || {}), [String(key)]: value };
+}
+
+function getCurrentSquadIds(teamDoc) {
+  return (teamDoc.players || [])
+    .map((entry) => toIdString(entry?.player))
+    .filter(Boolean);
+}
+
+function getCurrentStartingIds(teamDoc) {
+  return (teamDoc.players || [])
+    .filter((entry) => !!entry?.isStarting)
+    .map((entry) => toIdString(entry?.player))
+    .filter(Boolean);
+}
+
+function buildLineupSnapshot(teamDoc, startingIds, captain, viceCaptain, isDefault = false) {
+  return {
+    squad: getCurrentSquadIds(teamDoc),
+    starting: (startingIds || []).map(String),
+    captain: captain ? String(captain) : null,
+    viceCaptain: viceCaptain ? String(viceCaptain) : null,
+    setAt: new Date(),
+    isDefault: !!isDefault,
+  };
+}
+
+function getFantasyTeamGwSnapshot(teamDoc, gameweekNumber) {
+  const gwKey = gameweekNumber != null ? String(gameweekNumber) : null;
+  const gwSnapshot = gwKey ? getMapValue(teamDoc.lineupSnapshots, gwKey) : null;
+  const defaultSnapshot = getMapValue(teamDoc.lineupSnapshots, "default");
+  const snapshot = gwSnapshot || defaultSnapshot || {};
+
+  const currentSquad = getCurrentSquadIds(teamDoc);
+  const currentStarting = getCurrentStartingIds(teamDoc);
+  const squad = Array.isArray(snapshot.squad) && snapshot.squad.length
+    ? snapshot.squad.map(String)
+    : currentSquad;
+  const starting = Array.isArray(snapshot.starting) && snapshot.starting.length
+    ? snapshot.starting.map(String)
+    : currentStarting;
+
+  return {
+    squad,
+    starting,
+    captain: snapshot.captain ? String(snapshot.captain) : (teamDoc.captain ? String(teamDoc.captain) : null),
+    viceCaptain: snapshot.viceCaptain ? String(snapshot.viceCaptain) : (teamDoc.viceCaptain ? String(teamDoc.viceCaptain) : null),
+  };
+}
+
+function saveSnapshotForGw(teamDoc, gameweekNumber, snapshot) {
+  if (!teamDoc.lineupSnapshots || typeof teamDoc.lineupSnapshots !== "object") teamDoc.lineupSnapshots = {};
+  teamDoc.lineupSnapshots = setMapValue(teamDoc.lineupSnapshots, gameweekNumber, snapshot);
+  if (typeof teamDoc.markModified === "function") teamDoc.markModified("lineupSnapshots");
+}
+
 function assertPowerupSelectionAllowed(teamDoc, selectedPowerups, gameweekNumber) {
   if (!selectedPowerups || selectedPowerups.size === 0) return;
   ensurePowerupsShape(teamDoc);
@@ -580,6 +653,15 @@ export const makeTransfers = async (req, res, next) => {
     }
     team.transfers.lastResetGw = upcomingGW.number;
 
+    const transferSnapshot = buildLineupSnapshot(
+      team,
+      getCurrentStartingIds(team),
+      team.captain,
+      team.viceCaptain,
+      false
+    );
+    saveSnapshotForGw(team, upcomingGW.number, transferSnapshot);
+
     await team.save();
 
     // Return populated team so frontend receives populated player objects (and player.team)
@@ -716,22 +798,14 @@ export const setLineup = async (req, res, next) => {
     if (counts.FWD < 1 || counts.FWD > 3) return next(createError(400, "FWD must be between 1 and 3"));
 
     // create snapshot
-    const snapshot = {
-      starting: startingPlayerIds.map((id) => String(id)),
-      captain: String(captain),
-      viceCaptain: viceCaptain ? String(viceCaptain) : null,
-      setAt: new Date(),
-      isDefault: !!isDefault,
-    };
-
-    // ensure lineupSnapshots exists
-    if (!team.lineupSnapshots || typeof team.lineupSnapshots !== "object") team.lineupSnapshots = {};
+    const snapshot = buildLineupSnapshot(team, startingPlayerIds, captain, viceCaptain, isDefault);
 
     if (isDefault) {
-      team.lineupSnapshots["default"] = snapshot;
+      team.lineupSnapshots = setMapValue(team.lineupSnapshots, "default", snapshot);
     } else {
-      team.lineupSnapshots[String(targetGw)] = snapshot;
+      saveSnapshotForGw(team, targetGw, snapshot);
     }
+    if (typeof team.markModified === "function") team.markModified("lineupSnapshots");
 
     // update root-level captain/vice for convenience
     team.captain = String(captain);
@@ -1099,8 +1173,9 @@ export async function computePointsForMatch(matchId) {
       await Player.bulkWrite(playerBulkOps, { session });
     }
 
-    // Find fantasy teams containing any affected players
-    const fTeams = await FantasyTeam.find({ "players.player": { $in: playerIds } }).session(session).exec();
+    // Load teams broadly because historical gameweek snapshots may include players
+    // who are no longer in the team's current roster after later transfers.
+    const fTeams = await FantasyTeam.find({}).session(session).exec();
     const matchFantasyTeamPoints = {};
 
     for (const ft of fTeams) {
@@ -1110,39 +1185,35 @@ export async function computePointsForMatch(matchId) {
       const benchBoostActive = isPowerupActiveForGw(ft, "benchBoost", gameweekNumber);
       const tripleCaptainActive = isPowerupActiveForGw(ft, "tripleCaptain", gameweekNumber);
 
-      // build roster map for lookup
-      const rosterMap = {};
-      for (const pe of ft.players || []) {
-        const pid = String(pe.player);
-        rosterMap[pid] = pe; // contains isStarting, position, etc
-      }
+      const gwSnapshot = getFantasyTeamGwSnapshot(ft, gameweekNumber);
+      const squadSet = new Set(gwSnapshot.squad.map(String));
+      const startingSet = new Set(gwSnapshot.starting.map(String));
+      const eligibleSet = benchBoostActive ? squadSet : startingSet;
 
       const contributors = [];
       let teamTotalForMatch = 0;
 
       for (const pid of Object.keys(playerPoints)) {
-        if (!rosterMap[pid]) continue; // not on this fantasy team
-        const pe = rosterMap[pid];
-        const perf = perfByPlayer[pid] || {};
-        const played = !!(benchBoostActive || pe.isStarting);
-        if (!played) continue;
+        if (!eligibleSet.has(pid)) continue;
 
         let pPts = Number(playerPoints[pid] || 0);
-        const isCaptain = ft.captain && String(ft.captain) === pid;
-        const isVice = ft.viceCaptain && String(ft.viceCaptain) === pid;
+        const isCaptain = gwSnapshot.captain && String(gwSnapshot.captain) === pid;
+        const isVice = gwSnapshot.viceCaptain && String(gwSnapshot.viceCaptain) === pid;
         if (isCaptain) pPts = pPts * (tripleCaptainActive ? 3 : 2);
         teamTotalForMatch += pPts;
         contributors.push({
           playerId: pid,
           points: Number(playerPoints[pid] || 0),
           countedPoints: pPts,
-          isStarting: !!pe.isStarting,
+          isStarting: startingSet.has(pid),
           isCaptain: !!isCaptain,
           isVice: !!isVice,
           benchBoostActive,
           tripleCaptainActive,
         });
       }
+
+      if (contributors.length === 0) continue;
 
       // Save matchPoints entry keyed by match._id
       const matchKey = String(match._id);
@@ -1201,15 +1272,9 @@ export async function computePointsForMatch(matchId) {
             ? ft.lineupSnapshots.has(gwKey)
             : (ft.lineupSnapshots && Object.prototype.hasOwnProperty.call(ft.lineupSnapshots, gwKey));
 
-          const currentStarting = (ft.players || []).filter(p => !!p.isStarting).map(p => String(p.player));
+          const currentStarting = getCurrentStartingIds(ft);
           if (!hasSnapshot && currentStarting.length === 11) {
-            const snapshot = {
-              starting: currentStarting,
-              captain: ft.captain ? String(ft.captain) : null,
-              viceCaptain: ft.viceCaptain ? String(ft.viceCaptain) : null,
-              setAt: new Date(),
-              isDefault: false,
-            };
+            const snapshot = buildLineupSnapshot(ft, currentStarting, ft.captain, ft.viceCaptain, false);
 
             if (!ft.lineupSnapshots) ft.lineupSnapshots = {};
             if (typeof ft.lineupSnapshots.set === "function") {
@@ -1395,17 +1460,14 @@ export const substitutePlayers = async (req, res) => {
 
     // create a lineup snapshot under "default" — you can change key to a GW number if desired
     const startingIds = newPlayers.filter((p) => p.isStarting).map((p) => String(p.player));
-    const snapshot = {
-      starting: startingIds,
-      captain: team.captain ? String(team.captain) : null,
-      viceCaptain: team.viceCaptain ? String(team.viceCaptain) : null,
-      setAt: new Date(),
-      isDefault: true,
-    };
-
-    // ensure lineupSnapshots is a Map compatible object
+    const snapshot = buildLineupSnapshot(team, startingIds, team.captain, team.viceCaptain, true);
     if (!team.lineupSnapshots) team.lineupSnapshots = new Map();
-    team.lineupSnapshots.set("default", snapshot);
+    team.lineupSnapshots = setMapValue(team.lineupSnapshots, "default", snapshot);
+    const upcomingGW = await getUpcomingGameweek();
+    if (upcomingGW?.number) {
+      saveSnapshotForGw(team, upcomingGW.number, { ...snapshot, isDefault: false });
+    }
+    if (typeof team.markModified === "function") team.markModified("lineupSnapshots");
 
     await team.save();
 
@@ -1483,16 +1545,11 @@ export const setCaptainVice = async (req, res, next) => {
 
     team.lastLineupSetAt = new Date();
 
-    // also write snapshot
-    const snapshot = {
-      starting: startingIds,
-      captain: team.captain ? String(team.captain) : null,
-      viceCaptain: team.viceCaptain ? String(team.viceCaptain) : null,
-      setAt: new Date(),
-      isDefault: true,
-    };
-    if (!team.lineupSnapshots) team.lineupSnapshots = new Map();
-    team.lineupSnapshots.set("default", snapshot);
+    // also write snapshots so scoring uses the captain/vice selected for this gameweek
+    const snapshot = buildLineupSnapshot(team, startingIds, team.captain, team.viceCaptain, false);
+    saveSnapshotForGw(team, targetGw, snapshot);
+    team.lineupSnapshots = setMapValue(team.lineupSnapshots, "default", { ...snapshot, isDefault: true });
+    if (typeof team.markModified === "function") team.markModified("lineupSnapshots");
 
     await team.save();
 

@@ -14,6 +14,7 @@ const playerEntrySchema = new mongoose.Schema(
 
 const lineupSnapshotSchema = new mongoose.Schema(
   {
+    squad: [{ type: mongoose.Schema.Types.ObjectId, ref: "Player" }], // 15 ids for this gameweek
     starting: [{ type: mongoose.Schema.Types.ObjectId, ref: "Player" }], // 11 ids
     captain: { type: mongoose.Schema.Types.ObjectId, ref: "Player", default: null },
     viceCaptain: { type: mongoose.Schema.Types.ObjectId, ref: "Player", default: null },
