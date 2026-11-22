@@ -31,6 +31,8 @@ const transfersSchema = new mongoose.Schema(
   {
     lastResetGw: { type: Number, default: null },
     freeTransfersUsedInGw: { type: Number, default: 0 },
+    openingTransfersRemaining: { type: Number, default: 0 },
+    openingTransferWindow: { type: Boolean, default: false },
   },
   { _id: false }
 );

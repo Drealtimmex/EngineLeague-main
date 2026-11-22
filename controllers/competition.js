@@ -2,6 +2,7 @@ import Competition from "../models/Competition.js"
 import Team from "../models/Team.js"
 import Player from "../models/Player.js"
 import User from "../models/User.js"
+import FantasyTeam from "../models/Felteam.js"
 import { createError } from "../error.js";
 
 // Create Team
@@ -26,6 +27,35 @@ export const createCompetition = async (req, res, next) => {
       name, logo, season: season || name, isActive: true,
       teams: previousTeams.map((team) => team._id),
     });
+    // Carry returning managers into this season with clean points and a first-week squad refresh allowance.
+    // Old fantasy records remain tied to the previous competition and keep their historical scores.
+    if (previous) {
+      const previousFantasyTeams = await FantasyTeam.find({ competitionId: previous._id }).lean();
+      for (const oldFantasy of previousFantasyTeams) {
+        const squad = (oldFantasy.players || []).map((entry) => ({ ...entry }));
+        const squadIds = squad.map((entry) => entry.player).filter(Boolean);
+        const startingIds = squad.filter((entry) => entry.isStarting).map((entry) => entry.player).filter(Boolean);
+        await FantasyTeam.create({
+          user: oldFantasy.user,
+          teamName: oldFantasy.teamName,
+          teamLogo: oldFantasy.teamLogo,
+          players: squad,
+          budget: oldFantasy.budget,
+          points: 0,
+          competitionId: newCompetition._id,
+          captain: oldFantasy.captain || null,
+          viceCaptain: oldFantasy.viceCaptain || null,
+          effectiveGameweek: 1,
+          transfers: { lastResetGw: 1, freeTransfersUsedInGw: 0, openingTransfersRemaining: 15, openingTransferWindow: true },
+          powerups: { wildcard: { available: true }, benchBoost: { available: true }, tripleCaptain: { available: true } },
+          gameweekPoints: {},
+          matchPoints: {},
+          lineupSnapshots: { default: { squad: squadIds, starting: startingIds, captain: oldFantasy.captain || null, viceCaptain: oldFantasy.viceCaptain || null, isDefault: true, setAt: new Date() } },
+          lastLineupSetAt: null,
+          createdAt: new Date(),
+        });
+      }
+    }
     for (const team of previousTeams) {
       const oldId = String(previous._id);
       const snapshots = team.seasonSnapshots || new Map();

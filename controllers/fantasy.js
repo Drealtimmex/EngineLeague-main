@@ -504,7 +504,17 @@ export const makeTransfers = async (req, res, next) => {
     const numRequested = transfers.length;
     const wildcardActive = isPowerupActiveForGw(team, "wildcard", upcomingGW.number);
     if (wildcardActive) keepTransferCounterOpenForWildcard(team);
-    const freeLeft = Math.max(0, MAX_FREE_TRANSFERS_PER_GW - (team.transfers.freeTransfersUsedInGw || 0));
+    const openingTransferWindow = upcomingGW.number === 1 && team.transfers.openingTransferWindow === true;
+    const openingTransfersLeft = openingTransferWindow
+      ? Math.max(0, Number(team.transfers.openingTransfersRemaining || 0))
+      : 0;
+    if (upcomingGW.number > 1 && team.transfers.openingTransferWindow) {
+      team.transfers.openingTransferWindow = false;
+      team.transfers.openingTransfersRemaining = 0;
+    }
+    const freeLeft = openingTransferWindow
+      ? openingTransfersLeft
+      : Math.max(0, MAX_FREE_TRANSFERS_PER_GW - (team.transfers.freeTransfersUsedInGw || 0));
     if (TRANSFER_LIMITS_ENABLED && !wildcardActive && numRequested > freeLeft) {
       return next(createError(400, `You have ${freeLeft} free transfers left for this gameweek`));
     }
@@ -658,7 +668,15 @@ export const makeTransfers = async (req, res, next) => {
 
     // Update free transfers used
     if (TRANSFER_LIMITS_ENABLED && !wildcardActive) {
-      team.transfers.freeTransfersUsedInGw = (team.transfers.freeTransfersUsedInGw || 0) + numRequested;
+      if (openingTransferWindow) {
+        team.transfers.openingTransfersRemaining = Math.max(0, openingTransfersLeft - numRequested);
+      } else {
+        team.transfers.freeTransfersUsedInGw = (team.transfers.freeTransfersUsedInGw || 0) + numRequested;
+      }
+    }
+    if (wildcardActive && openingTransferWindow) {
+      team.transfers.openingTransfersRemaining = 0;
+      team.transfers.openingTransferWindow = false;
     }
     team.transfers.lastResetGw = upcomingGW.number;
 
@@ -895,8 +913,36 @@ export const getFantasyTeamByLoggedId = async (req, res, next) => {
   try {
     const user = req.user.id
     const competitionId = req.query.competitionId || (await Competition.findOne({ isActive: true }).sort({ createdAt: -1 }).lean())?._id;
-    const team = await FantasyTeam.findOne({ user, ...(competitionId ? { competitionId } : {}) }).populate("user", "username email").populate("players.player", "name position team price").exec();
+    let team = await FantasyTeam.findOne({ user, ...(competitionId ? { competitionId } : {}) }).exec();
+    // Backfill returning managers when this active season was created before rollover support.
+    if (!team && competitionId) {
+      const targetCompetition = await Competition.findById(competitionId).select("createdAt").lean().exec();
+      const previousCompetition = targetCompetition
+        ? await Competition.findOne({ _id: { $ne: competitionId }, createdAt: { $lt: targetCompetition.createdAt } }).sort({ createdAt: -1 }).select("_id").lean().exec()
+        : null;
+      const previousTeam = previousCompetition
+        ? await FantasyTeam.findOne({ user, competitionId: previousCompetition._id }).lean().exec()
+        : null;
+      if (previousTeam) {
+        const squad = (previousTeam.players || []).map((entry) => ({ ...entry }));
+        const squadIds = squad.map((entry) => entry.player).filter(Boolean);
+        const startingIds = squad.filter((entry) => entry.isStarting).map((entry) => entry.player).filter(Boolean);
+        team = await FantasyTeam.create({
+          user, teamName: previousTeam.teamName, teamLogo: previousTeam.teamLogo,
+          players: squad, budget: previousTeam.budget, points: 0, competitionId,
+          captain: previousTeam.captain || null, viceCaptain: previousTeam.viceCaptain || null,
+          effectiveGameweek: 1,
+          transfers: { lastResetGw: 1, freeTransfersUsedInGw: 0, openingTransfersRemaining: 15, openingTransferWindow: true },
+          powerups: { wildcard: { available: true }, benchBoost: { available: true }, tripleCaptain: { available: true } },
+          gameweekPoints: {}, matchPoints: {},
+          lineupSnapshots: { default: { squad: squadIds, starting: startingIds, captain: previousTeam.captain || null, viceCaptain: previousTeam.viceCaptain || null, isDefault: true, setAt: new Date() } },
+          lastLineupSetAt: null, createdAt: new Date(),
+        });
+      }
+    }
     if (!team) return next(createError(404, "Fantasy team not found"));
+    await team.populate("user", "username email");
+    await team.populate("players.player", "name position team price");
     ensurePowerupsShape(team);
     return res.status(200).json({ success: true, data: team });
   } catch (err) {
