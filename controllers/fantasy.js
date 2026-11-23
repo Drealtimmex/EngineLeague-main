@@ -539,6 +539,19 @@ export const makeTransfers = async (req, res, next) => {
     }
 
     const numRequested = transfers.length;
+    if (numRequested === 0) {
+      return next(createError(400, "Select at least one player to transfer"));
+    }
+    // Reject malformed and repeated pairs before querying Mongo or changing the
+    // working roster. Repeated ids can otherwise produce ambiguous replacements.
+    if (transfers.some((transfer) => !transfer || !transfer.out || !transfer.in)) {
+      return next(createError(400, "Each transfer must include an outgoing and incoming player"));
+    }
+    const requestedOutIds = transfers.map((transfer) => String(transfer.out));
+    const requestedInIds = transfers.map((transfer) => String(transfer.in));
+    if (new Set(requestedOutIds).size !== requestedOutIds.length || new Set(requestedInIds).size !== requestedInIds.length) {
+      return next(createError(400, "A player can only appear once in a transfer request"));
+    }
     const wildcardActive = isPowerupActiveForGw(team, "wildcard", upcomingGW.number);
     if (wildcardActive) keepTransferCounterOpenForWildcard(team);
     // The opening roster is chosen in the squad builder. Legacy opening-window
@@ -568,8 +581,8 @@ export const makeTransfers = async (req, res, next) => {
     const rosterMap = new Map(roster.map((r) => [String(r.player), r]));
 
     // Validate out/in ids presence and uniqueness
-    const outIds = transfers.map((t) => String(t.out));
-    const inIds = transfers.map((t) => String(t.in));
+    const outIds = requestedOutIds;
+    const inIds = requestedInIds;
 
     // ensure outs exist in roster
     for (const outId of outIds) {
