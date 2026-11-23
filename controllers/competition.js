@@ -27,30 +27,28 @@ export const createCompetition = async (req, res, next) => {
       name, logo, season: season || name, isActive: true,
       teams: previousTeams.map((team) => team._id),
     });
-    // Carry returning managers into this season with clean points and a first-week squad refresh allowance.
-    // Old fantasy records remain tied to the previous competition and keep their historical scores.
+    // Carry manager identities into the new season, but require a fresh squad.
+    // The previous competition's fantasy teams and snapshots are left untouched.
     if (previous) {
       const previousFantasyTeams = await FantasyTeam.find({ competitionId: previous._id }).lean();
       for (const oldFantasy of previousFantasyTeams) {
-        const squad = (oldFantasy.players || []).map((entry) => ({ ...entry }));
-        const squadIds = squad.map((entry) => entry.player).filter(Boolean);
-        const startingIds = squad.filter((entry) => entry.isStarting).map((entry) => entry.player).filter(Boolean);
         await FantasyTeam.create({
           user: oldFantasy.user,
           teamName: oldFantasy.teamName,
           teamLogo: oldFantasy.teamLogo,
-          players: squad,
-          budget: oldFantasy.budget,
+          players: [],
+          budget: 150,
           points: 0,
           competitionId: newCompetition._id,
-          captain: oldFantasy.captain || null,
-          viceCaptain: oldFantasy.viceCaptain || null,
+          captain: null,
+          viceCaptain: null,
           effectiveGameweek: 1,
-          transfers: { lastResetGw: 1, freeTransfersUsedInGw: 0, openingTransfersRemaining: 15, openingTransferWindow: true },
+          // Full squad selection is the GW1 action; transfers remain capped at 3.
+          transfers: { lastResetGw: 1, freeTransfersUsedInGw: 3, openingTransfersRemaining: 0, openingTransferWindow: false },
           powerups: { wildcard: { available: true }, benchBoost: { available: true }, tripleCaptain: { available: true } },
           gameweekPoints: {},
           matchPoints: {},
-          lineupSnapshots: { default: { squad: squadIds, starting: startingIds, captain: oldFantasy.captain || null, viceCaptain: oldFantasy.viceCaptain || null, isDefault: true, setAt: new Date() } },
+          lineupSnapshots: { default: { squad: [], starting: [], captain: null, viceCaptain: null, isDefault: true, setAt: new Date() } },
           lastLineupSetAt: null,
           createdAt: new Date(),
         });

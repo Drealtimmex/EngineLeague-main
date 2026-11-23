@@ -33,7 +33,7 @@ const MID_MIN = 4;
 const MID_MAX = 5;
 const FWD_MIN = 2;
 const FWD_MAX = 3;
-const MAX_FROM_SAME_TEAM = 7;
+const MAX_FROM_SAME_TEAM = 3;
 const MAX_FREE_TRANSFERS_PER_GW = 3;
 const TRANSFER_LIMITS_ENABLED = true;
 const POWERUP_KEYS = ["wildcard", "benchBoost", "tripleCaptain"];
@@ -299,7 +299,7 @@ async function validateAndEnrichSquad(playersInput = [], budget = 150, options =
     const teamId = p.team ? p.team._id.toString() : "unknown";
     teamCounts[teamId] = (teamCounts[teamId] || 0) + 1;
     const customPrice = priceByPlayerId[String(p._id)];
-    const price = typeof customPrice === "number" ? customPrice : (typeof p.price === "number" ? p.price : 10);
+    const price = typeof customPrice === "number" ? customPrice : (typeof p.price === "number" ? p.price : 7);
     totalPrice += price;
 
     return {
@@ -331,6 +331,26 @@ async function validateAndEnrichSquad(playersInput = [], budget = 150, options =
   return { valid: true, enriched, totalPrice };
 }
 
+// New squads get a valid, editable 4-4-2 by default so four players remain on
+// the bench. Managers can change the XI from the team page before the deadline.
+function applyDefaultStartingXI(players = []) {
+  const limits = { GK: 1, DEF: 4, MID: 4, FWD: 2 };
+  const used = { GK: 0, DEF: 0, MID: 0, FWD: 0 };
+  return players.map((entry) => {
+    const category = normalizePositionCategory(entry.position);
+    const isStarting = (used[category] || 0) < (limits[category] || 0);
+    if (isStarting) used[category] += 1;
+    return { ...entry, isStarting };
+  });
+}
+
+function openingSquadPrices(players = []) {
+  return Object.fromEntries(players.map((entry) => {
+    const playerId = entry?.player?._id || entry?.player || entry?._id || entry;
+    return [String(playerId), 7];
+  }));
+}
+
 /* -----------------------
    Controller actions
    ----------------------- */
@@ -342,14 +362,15 @@ async function validateAndEnrichSquad(playersInput = [], budget = 150, options =
 export const createFantasyTeam = async (req, res, next) => {
   try {
     const userId = req.user.id;
-    let { teamName, players, teamLogo, budget = 150, competitionId } = req.body;
+    let { teamName, players, teamLogo, competitionId } = req.body;
+    const budget = 150;
     if (!teamName) return next(createError(400, "teamName required"));
     if (!players || !Array.isArray(players)) return next(createError(400, "players array required"));
     if (!competitionId) competitionId = (await Competition.findOne({ isActive: true }).sort({ createdAt: -1 }).lean())?._id || null;
     const checking = await FantasyTeam.findOne({ user: userId, competitionId });
     if (checking) return next(createError(409, "You already have a fantasy team for this competition"));
     // Validate/enrich squad
-    const validation = await validateAndEnrichSquad(players, budget);
+    const validation = await validateAndEnrichSquad(players, budget, { priceByPlayerId: openingSquadPrices(players) });
     if (!validation.valid) return next(createError(400, validation.message));
 
     // Determine effective gameweek
@@ -360,7 +381,7 @@ export const createFantasyTeam = async (req, res, next) => {
       user: userId,
       teamName,
       teamLogo: teamLogo || null,
-      players: validation.enriched,
+      players: applyDefaultStartingXI(validation.enriched),
       budget,
       points: 0,
       competitionId: competitionId || null,
@@ -416,10 +437,26 @@ export const editFantasyTeam = async (req, res, next) => {
 
     // If players provided, validate
     if (players) {
-      const validation = await validateAndEnrichSquad(players, team.budget);
+      const isNewSeasonSquad = (team.players || []).length === 0;
+      const validation = await validateAndEnrichSquad(players, team.budget, {
+        ...(isNewSeasonSquad ? { priceByPlayerId: openingSquadPrices(players) } : {}),
+      });
       if (!validation.valid) return next(createError(400, validation.message));
       // replace players
-      team.players = validation.enriched;
+      team.players = isNewSeasonSquad ? applyDefaultStartingXI(validation.enriched) : validation.enriched;
+      if (isNewSeasonSquad) {
+        team.budget = 150;
+        team.captain = null;
+        team.viceCaptain = null;
+        team.effectiveGameweek = 1;
+        team.transfers = { lastResetGw: 1, freeTransfersUsedInGw: MAX_FREE_TRANSFERS_PER_GW, openingTransfersRemaining: 0, openingTransferWindow: false };
+        const snapshots = team.lineupSnapshots || new Map();
+        const defaultSnapshot = { squad: team.players.map((entry) => entry.player), starting: team.players.filter((entry) => entry.isStarting).map((entry) => entry.player), captain: null, viceCaptain: null, isDefault: true, setAt: new Date() };
+        if (typeof snapshots.set === "function") snapshots.set("default", defaultSnapshot);
+        else snapshots.default = defaultSnapshot;
+        team.lineupSnapshots = snapshots;
+        team.markModified("lineupSnapshots");
+      }
     }
 
     if (teamName) team.teamName = teamName;
@@ -504,17 +541,11 @@ export const makeTransfers = async (req, res, next) => {
     const numRequested = transfers.length;
     const wildcardActive = isPowerupActiveForGw(team, "wildcard", upcomingGW.number);
     if (wildcardActive) keepTransferCounterOpenForWildcard(team);
-    const openingTransferWindow = upcomingGW.number === 1 && team.transfers.openingTransferWindow === true;
-    const openingTransfersLeft = openingTransferWindow
-      ? Math.max(0, Number(team.transfers.openingTransfersRemaining || 0))
-      : 0;
-    if (upcomingGW.number > 1 && team.transfers.openingTransferWindow) {
-      team.transfers.openingTransferWindow = false;
-      team.transfers.openingTransfersRemaining = 0;
-    }
-    const freeLeft = openingTransferWindow
-      ? openingTransfersLeft
-      : Math.max(0, MAX_FREE_TRANSFERS_PER_GW - (team.transfers.freeTransfersUsedInGw || 0));
+    // The opening roster is chosen in the squad builder. Legacy opening-window
+    // flags must not grant more than the normal three free transfers.
+    team.transfers.openingTransferWindow = false;
+    team.transfers.openingTransfersRemaining = 0;
+    const freeLeft = Math.max(0, MAX_FREE_TRANSFERS_PER_GW - (team.transfers.freeTransfersUsedInGw || 0));
     if (TRANSFER_LIMITS_ENABLED && !wildcardActive && numRequested > freeLeft) {
       return next(createError(400, `You have ${freeLeft} free transfers left for this gameweek`));
     }
@@ -668,15 +699,7 @@ export const makeTransfers = async (req, res, next) => {
 
     // Update free transfers used
     if (TRANSFER_LIMITS_ENABLED && !wildcardActive) {
-      if (openingTransferWindow) {
-        team.transfers.openingTransfersRemaining = Math.max(0, openingTransfersLeft - numRequested);
-      } else {
-        team.transfers.freeTransfersUsedInGw = (team.transfers.freeTransfersUsedInGw || 0) + numRequested;
-      }
-    }
-    if (wildcardActive && openingTransferWindow) {
-      team.transfers.openingTransfersRemaining = 0;
-      team.transfers.openingTransferWindow = false;
+      team.transfers.freeTransfersUsedInGw = (team.transfers.freeTransfersUsedInGw || 0) + numRequested;
     }
     team.transfers.lastResetGw = upcomingGW.number;
 
@@ -924,18 +947,15 @@ export const getFantasyTeamByLoggedId = async (req, res, next) => {
         ? await FantasyTeam.findOne({ user, competitionId: previousCompetition._id }).lean().exec()
         : null;
       if (previousTeam) {
-        const squad = (previousTeam.players || []).map((entry) => ({ ...entry }));
-        const squadIds = squad.map((entry) => entry.player).filter(Boolean);
-        const startingIds = squad.filter((entry) => entry.isStarting).map((entry) => entry.player).filter(Boolean);
         team = await FantasyTeam.create({
           user, teamName: previousTeam.teamName, teamLogo: previousTeam.teamLogo,
-          players: squad, budget: previousTeam.budget, points: 0, competitionId,
-          captain: previousTeam.captain || null, viceCaptain: previousTeam.viceCaptain || null,
+          players: [], budget: 150, points: 0, competitionId,
+          captain: null, viceCaptain: null,
           effectiveGameweek: 1,
-          transfers: { lastResetGw: 1, freeTransfersUsedInGw: 0, openingTransfersRemaining: 15, openingTransferWindow: true },
+          transfers: { lastResetGw: 1, freeTransfersUsedInGw: MAX_FREE_TRANSFERS_PER_GW, openingTransfersRemaining: 0, openingTransferWindow: false },
           powerups: { wildcard: { available: true }, benchBoost: { available: true }, tripleCaptain: { available: true } },
           gameweekPoints: {}, matchPoints: {},
-          lineupSnapshots: { default: { squad: squadIds, starting: startingIds, captain: previousTeam.captain || null, viceCaptain: previousTeam.viceCaptain || null, isDefault: true, setAt: new Date() } },
+          lineupSnapshots: { default: { squad: [], starting: [], captain: null, viceCaptain: null, isDefault: true, setAt: new Date() } },
           lastLineupSetAt: null, createdAt: new Date(),
         });
       }
