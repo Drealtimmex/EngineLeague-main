@@ -1,5 +1,5 @@
 import express from "express";
-import { getGameweeksWithMatches,getMatchesByTeam,getSingleMatchById,revertMatchFulltime,updateMatch} from "../controllers/match.js";
+import { getGameweeksWithMatches,getMatchesByTeam,getSingleMatchById,revertMatchFulltime,revertMatchEvent,updateMatch} from "../controllers/match.js";
 import { verifyToken } from "../verifyToken.js";
 import { addMatchListener } from "../utils/liveMatchEvents.js";
 
@@ -22,6 +22,7 @@ router.get("/:id",getSingleMatchById)
 //update
 router.put("/",verifyToken, updateMatch);
 router.post("/:id/revert-fulltime", verifyToken, revertMatchFulltime);
+router.post("/:id/revert-event", verifyToken, revertMatchEvent);
 
 
 export default router;

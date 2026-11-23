@@ -1116,8 +1116,21 @@ async function applyAutomaticBenchSubs(competitionId, gameweekNumber, session) {
     const startingSet = new Set(resolvedStarting);
     const activeSquad = isPowerupActiveForGw(team, "benchBoost", gameweekNumber) ? new Set(squad) : startingSet;
     const originalCaptain = storedSnapshot.captain ? String(storedSnapshot.captain) : snapshot.captain;
-    const captainPlayed = originalCaptain && played.has(originalCaptain);
-    const effectiveCaptain = captainPlayed ? originalCaptain : (snapshot.viceCaptain && played.has(snapshot.viceCaptain) ? snapshot.viceCaptain : originalCaptain);
+    const originalVice = storedSnapshot.viceCaptain ? String(storedSnapshot.viceCaptain) : snapshot.viceCaptain;
+    // Keep captaincy roles on the deadline snapshot, but resolve a non-playing
+    // captain/vice onto the playing bench player who replaced them. If the
+    // captain has no eligible replacement, the vice-captain (or their
+    // replacement) inherits the multiplier.
+    const resolvedCaptain = originalCaptain && played.has(originalCaptain)
+      ? originalCaptain
+      : (replacements.get(String(originalCaptain || ""))
+        || (originalVice && played.has(originalVice) ? originalVice : null)
+        || replacements.get(String(originalVice || ""))
+        || originalCaptain);
+    const resolvedVice = originalVice && played.has(originalVice)
+      ? originalVice
+      : (replacements.get(String(originalVice || "")) || originalVice);
+    const effectiveCaptain = resolvedCaptain;
     const triple = isPowerupActiveForGw(team, "tripleCaptain", gameweekNumber);
     const matchPoints = typeof team.matchPoints?.entries === "function" ? Object.fromEntries(team.matchPoints.entries()) : { ...(team.matchPoints || {}) };
 
@@ -1130,7 +1143,7 @@ async function applyAutomaticBenchSubs(competitionId, gameweekNumber, session) {
         const isCaptain = String(effectiveCaptain || "") === playerId;
         const countedPoints = points * (isCaptain ? (triple ? 3 : 2) : 1);
         total += countedPoints;
-        contributions.push({ playerId, points, countedPoints, isStarting: startingSet.has(playerId), isCaptain, isVice: String(snapshot.viceCaptain || "") === playerId });
+        contributions.push({ playerId, points, countedPoints, isStarting: startingSet.has(playerId), isCaptain, isVice: String(resolvedVice || "") === playerId });
       }
       matchPoints[String(match._id)] = { points: total, gameweek: gameweekNumber, contributors: contributions };
       await Match.updateOne(
@@ -1147,6 +1160,7 @@ async function applyAutomaticBenchSubs(competitionId, gameweekNumber, session) {
     team.lineupSnapshots = setMapValue(team.lineupSnapshots, gameweekNumber, {
       ...storedSnapshot, squad, resolvedStarting,
       resolvedCaptain: effectiveCaptain ? String(effectiveCaptain) : null,
+      resolvedVice: resolvedVice ? String(resolvedVice) : null,
       setAt: new Date(), isDefault: false,
     });
     team.markModified("matchPoints");

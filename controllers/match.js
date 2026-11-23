@@ -306,6 +306,121 @@ export const revertMatchFulltime = async (req, res, next) => {
   }
 };
 
+// Revert a single saved goal, card, or substitution while the match is still
+// being edited. Full-time/fantasy-processed matches must be reopened first so
+// standings and fantasy points can never be left out of sync.
+export const revertMatchEvent = async (req, res, next) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  const fail = async (status, message) => {
+    await session.abortTransaction();
+    session.endSession();
+    return next(createError(status, message));
+  };
+  try {
+    const userId = req.user?.id;
+    if (!userId) return fail(401, "Not authenticated");
+    const user = await User.findById(userId).session(session).lean().exec();
+    if (!user) return fail(404, "User not found");
+    if (user.role !== "admin") return fail(403, "Only admins can revert match actions");
+
+    const { eventType, eventId } = req.body || {};
+    if (!eventId || !isValidId(eventId) || !["goal", "card", "substitution"].includes(eventType)) {
+      return fail(400, "A valid eventType and eventId are required");
+    }
+    const match = await Match.findById(req.params.id).session(session);
+    if (!match) return fail(404, "Match not found");
+    if (match.fulltime || match.fantasyProcessed) {
+      return fail(409, "Reopen the match before reverting a saved action");
+    }
+
+    const field = eventType === "goal" ? "goals" : eventType === "card" ? "cards" : "substitutions";
+    const events = match[field] || [];
+    const index = events.findIndex((event) => String(event._id) === String(eventId));
+    if (index < 0) return fail(404, "Saved match action not found");
+    const [event] = events.splice(index, 1);
+
+    const cleanEmptyPerformance = async (playerId) => {
+      if (!playerId) return;
+      const player = await Player.findById(playerId).session(session);
+      if (!player) return;
+      const perf = (player.matchPerformances || []).find((entry) => idEquals(entry.match, match._id));
+      if (!perf) return;
+      const hasAppearance = (match.lineups?.home || []).some((id) => idEquals(id, playerId))
+        || (match.lineups?.away || []).some((id) => idEquals(id, playerId))
+        || (match.substitutions || []).some((sub) => idEquals(sub.playerIn, playerId) || idEquals(sub.playerOut, playerId));
+      const hasRemainingCard = (match.cards || []).some((card) => idEquals(card.player, playerId));
+      const hasRemainingGoal = (match.goals || []).some((goal) => idEquals(goal.scorer, playerId) || idEquals(goal.assist, playerId) || idEquals(goal.ownBy, playerId));
+      if (!hasAppearance && !hasRemainingCard && !hasRemainingGoal && !perf.manOfTheMatch && !perf.goals && !perf.assists && !perf.yellowCards && !perf.redCard) {
+        player.matchPerformances = (player.matchPerformances || []).filter((entry) => !idEquals(entry.match, match._id));
+        await player.save({ session });
+      }
+    };
+
+    if (eventType === "goal") {
+      if (event.scorer) {
+        const scorer = await Player.findById(event.scorer).session(session);
+        if (scorer) {
+          scorer.goals = subtractNonNegative(scorer.goals, 1);
+          const perf = (scorer.matchPerformances || []).find((entry) => idEquals(entry.match, match._id));
+          if (perf) perf.goals = subtractNonNegative(perf.goals, 1);
+          await scorer.save({ session });
+          await cleanEmptyPerformance(scorer._id);
+        }
+      }
+      if (event.assist) {
+        const assister = await Player.findById(event.assist).session(session);
+        if (assister) {
+          assister.assists = subtractNonNegative(assister.assists, 1);
+          const perf = (assister.matchPerformances || []).find((entry) => idEquals(entry.match, match._id));
+          if (perf) perf.assists = subtractNonNegative(perf.assists, 1);
+          await assister.save({ session });
+          await cleanEmptyPerformance(assister._id);
+        }
+      }
+    } else if (eventType === "card" && event.player) {
+      const player = await Player.findById(event.player).session(session);
+      if (player) {
+        const perf = (player.matchPerformances || []).find((entry) => idEquals(entry.match, match._id));
+        const previousYellows = Number(perf?.yellowCards || 0);
+        const previousImplicitSecondYellow = previousYellows >= 2 ? 1 : 0;
+        const explicitRedsRemaining = (match.cards || []).filter((card) => idEquals(card.player, event.player) && card.type === "Red").length;
+        if (event.type === "Yellow") {
+          player.totalyellowCards = subtractNonNegative(player.totalyellowCards, 1);
+          if (perf) perf.yellowCards = subtractNonNegative(perf.yellowCards, 1);
+          const remainingYellows = Number(perf?.yellowCards || 0);
+          const remainingImplicitSecondYellow = remainingYellows >= 2 ? 1 : 0;
+          const reversedSecondYellow = previousImplicitSecondYellow - remainingImplicitSecondYellow;
+          player.totalredCards = subtractNonNegative(player.totalredCards, reversedSecondYellow);
+          player.matchBan = subtractNonNegative(player.matchBan, reversedSecondYellow);
+        } else {
+          player.totalredCards = subtractNonNegative(player.totalredCards, 1);
+          player.matchBan = subtractNonNegative(player.matchBan, 3);
+        }
+        if (perf) perf.redCard = explicitRedsRemaining > 0 || Number(perf.yellowCards || 0) >= 2;
+        await player.save({ session });
+        await cleanEmptyPerformance(player._id);
+      }
+    } else if (eventType === "substitution") {
+      await cleanEmptyPerformance(event.playerIn);
+      await cleanEmptyPerformance(event.playerOut);
+    }
+
+    if (typeof match.recomputeScoresFromGoals === "function") match.recomputeScoresFromGoals();
+    match.updatedAt = new Date();
+    await match.save({ session });
+    await session.commitTransaction();
+    session.endSession();
+    publishMatchUpdate(match._id, { matchId: String(match._id), type: `${eventType}-reverted`, updatedAt: new Date().toISOString() });
+    return res.status(200).json({ success: true, message: "Saved match action reverted", data: { matchId: String(match._id), eventType, eventId: String(eventId), homeScore: match.homeScore, awayScore: match.awayScore } });
+  } catch (error) {
+    try { await session.abortTransaction(); } catch {}
+    session.endSession();
+    console.error("Error reverting match action:", error);
+    return next(createError(500, "Could not revert match action"));
+  }
+};
+
 /**
  * updateMatch: full update handler (goals, cards, subs, matchRatings, lineup, bench, manOftheMatch, scalars)
  */

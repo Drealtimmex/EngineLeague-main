@@ -17,6 +17,7 @@ import timelineRoutes from "./routes/timeline.js"
 import analyticsRoutes from "./routes/analytics.js"
 import sponsorRoutes from "./routes/sponsors.js"
 import contentRoutes from "./routes/content.js"
+import adminGuideRoutes from "./routes/adminGuide.js"
 import "./controllers/cronjob/cron.js"
 import "./controllers/gameweek.js"
 import bodyParser from "body-parser";
@@ -57,6 +58,7 @@ app.use("/api/timeline",timelineRoutes)
 app.use("/api/analytics",analyticsRoutes)
 app.use("/api/sponsors", sponsorRoutes)
 app.use("/api/content", contentRoutes)
+app.use("/api/admin/guide", adminGuideRoutes)
 // Use email routes
 // app.use('/api', emailRoutes);
 

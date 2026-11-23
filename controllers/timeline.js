@@ -2,6 +2,7 @@
 import { createError } from "../error.js";
 import Timeline from "../models/Timeline.js";
 import Match from "../models/Match.js";
+import User from "../models/User.js";
 import mongoose from "mongoose";
 
 /**
@@ -13,10 +14,12 @@ import mongoose from "mongoose";
 export const createTimeline = async (req, res, next) => {
   try {
     const userId = req.user?.id;
-    const { matchId, title, description, images = [] } = req.body;
+    const { matchId, title, description, images = [], media = [], highlight = false } = req.body;
+    const user = userId ? await User.findById(userId).select("role").lean() : null;
+    if (!user || user.role !== "admin") return next(createError(403, "Only admins can publish match updates and highlights"));
 
     if (!matchId) return next(createError(400, "matchId is required"));
-    if (!title && !description && (!images || images.length === 0)) {
+    if (!title && !description && (!images || images.length === 0) && (!media || media.length === 0)) {
       return next(createError(400, "At least one of title/description/images is required"));
     }
 
@@ -29,6 +32,8 @@ export const createTimeline = async (req, res, next) => {
       title: title || "",
       description: description || "",
       images: Array.isArray(images) ? images : [],
+      media: Array.isArray(media) ? media.filter((item) => item?.url).map((item) => ({ type: item.type || "image", url: String(item.url), caption: item.caption || "" })) : [],
+      highlight: Boolean(highlight),
       match: match._id,
       createdAt: new Date(),
     });
@@ -91,6 +96,8 @@ export const getTimelinesByMatch = async (req, res, next) => {
  */
 export const deleteTimeline = async (req, res, next) => {
   try {
+    const user = req.user?.id ? await User.findById(req.user.id).select("role").lean() : null;
+    if (!user || user.role !== "admin") return next(createError(403, "Only admins can delete match updates"));
     const timelineId = req.params.id;
     if (!timelineId) return next(createError(400, "timeline id required"));
 
@@ -127,11 +134,15 @@ export const updateTimeline = async (req, res, next) => {
     const timelineId = req.params.id;
     if (!timelineId) return next(createError(400, "timeline id required"));
 
-    const { title, description, images } = req.body;
+    const user = req.user?.id ? await User.findById(req.user.id).select("role").lean() : null;
+    if (!user || user.role !== "admin") return next(createError(403, "Only admins can edit match updates"));
+    const { title, description, images, media, highlight } = req.body;
     const updates = {};
     if (title !== undefined) updates.title = title;
     if (description !== undefined) updates.description = description;
     if (images !== undefined) updates.images = Array.isArray(images) ? images : [];
+    if (media !== undefined) updates.media = Array.isArray(media) ? media.filter((item) => item?.url).map((item) => ({ type: item.type || "image", url: String(item.url), caption: item.caption || "" })) : [];
+    if (highlight !== undefined) updates.highlight = Boolean(highlight);
 
     const updated = await Timeline.findByIdAndUpdate(timelineId, { $set: updates }, { new: true }).exec();
     if (!updated) return next(createError(404, "Timeline not found"));
