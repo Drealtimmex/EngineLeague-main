@@ -31,7 +31,7 @@ export async function listArticles(req, res, next) {
   try {
     const isAdminListing = req.path.endsWith("/admin") || req.query.admin === "true";
     const filter = isAdminListing ? (await requireAdmin(req), {}) : { status: "published", publishedAt: { $lte: new Date() } };
-    const data = await Article.find(filter).sort({ publishedAt: -1, createdAt: -1 }).limit(100).populate("poll", "question options resultsVisibility closesAt active").lean().exec();
+    const data = await Article.find(filter).sort({ publishedAt: -1, createdAt: -1 }).populate("poll", "question options resultsVisibility closesAt active").lean().exec();
     res.json({ success: true, data });
   } catch (error) { next(error); }
 }

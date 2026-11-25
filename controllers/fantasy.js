@@ -189,14 +189,29 @@ function getFantasyTeamGwSnapshot(teamDoc, gameweekNumber) {
   const gwKey = gameweekNumber != null ? String(gameweekNumber) : null;
   const gwSnapshot = gwKey ? getMapValue(teamDoc.lineupSnapshots, gwKey) : null;
   const defaultSnapshot = getMapValue(teamDoc.lineupSnapshots, "default");
-  const snapshot = gwSnapshot || defaultSnapshot || {};
+  // If a manager does not submit a new lineup for this gameweek, carry forward
+  // their most recent saved gameweek lineup. The default snapshot is only the
+  // fallback before any gameweek lineup exists.
+  const snapshotEntries = teamDoc.lineupSnapshots && typeof teamDoc.lineupSnapshots.entries === "function"
+    ? Array.from(teamDoc.lineupSnapshots.entries())
+    : Object.entries(teamDoc.lineupSnapshots || {});
+  const previousSnapshot = gwKey
+    ? snapshotEntries
+      .filter(([key, value]) => /^\d+$/.test(String(key)) && Number(key) < Number(gwKey) && value)
+      .sort(([a], [b]) => Number(b) - Number(a))[0]?.[1]
+    : null;
+  const snapshot = gwSnapshot || previousSnapshot || defaultSnapshot || {};
 
   const currentSquad = getCurrentSquadIds(teamDoc);
   const currentStarting = getCurrentStartingIds(teamDoc);
   const squad = Array.isArray(snapshot.squad) && snapshot.squad.length
     ? snapshot.squad.map(String)
     : currentSquad;
-  const effectiveStarting = snapshot.resolvedStarting?.length ? snapshot.resolvedStarting : snapshot.starting;
+  // Resolved auto-subs are specific to the gameweek they were calculated for;
+  // carry forward the manager's saved XI, not last week's auto-sub result.
+  const effectiveStarting = gwSnapshot && snapshot.resolvedStarting?.length
+    ? snapshot.resolvedStarting
+    : snapshot.starting;
   const starting = Array.isArray(effectiveStarting) && effectiveStarting.length
     ? effectiveStarting.map(String)
     : currentStarting;
@@ -918,12 +933,18 @@ export const setLineup = async (req, res, next) => {
 export const getAllFantasyTeams = async (req, res, next) => {
   try {
     const { userId, competitionId } = req.query;
-    const filter = {};
+    // Public fantasy lists default to the active season. Without this, callers
+    // that omit competitionId accidentally merge old-season teams and points.
+    const selectedCompetitionId = competitionId || (await Competition.findOne({ isActive: true }).sort({ createdAt: -1 }).select("_id").lean().exec())?._id;
+    if (!selectedCompetitionId) return res.status(200).json({ success: true, data: [] });
+    const filter = { competitionId: selectedCompetitionId };
     if (userId) filter.user = userId;
-    if (competitionId) filter.competitionId = competitionId;
     const teams = await FantasyTeam.find(filter).populate("user", "username email").populate("players.player", "name position team price playerPic").exec();
-    teams.forEach((team) => ensurePowerupsShape(team));
-    return res.status(200).json({ success: true, data: teams });
+    // MongoDB does not cascade user deletion into fantasy teams. Exclude
+    // orphaned team documents so removed accounts do not remain on standings.
+    const visibleTeams = teams.filter((team) => !!team.user);
+    visibleTeams.forEach((team) => ensurePowerupsShape(team));
+    return res.status(200).json({ success: true, data: visibleTeams });
   } catch (err) {
     console.error("[getAllFantasyTeams] error:", err);
     next(err);
@@ -937,7 +958,7 @@ export const getFantasyTeamById = async (req, res, next) => {
   try {
     const { id } = req.params;
     const team = await FantasyTeam.findById(id).populate("user", "username email").populate("players.player", "name position team price playerPic").exec();
-    if (!team) return next(createError(404, "Fantasy team not found"));
+    if (!team || !team.user) return next(createError(404, "Fantasy team not found"));
     ensurePowerupsShape(team);
     return res.status(200).json({ success: true, data: team });
   } catch (err) {
